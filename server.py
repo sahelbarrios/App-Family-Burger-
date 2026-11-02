@@ -3682,7 +3682,9 @@ function App() {
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Usamos {% raw %} para que Jinja2 no intente interpretar las llaves de React/JSX
+    template_seguro = "{% raw %}" + HTML_TEMPLATE + "{% endraw %}"
+    return render_template_string(template_seguro)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
