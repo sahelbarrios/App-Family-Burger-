@@ -24,3 +24,19 @@ services:
         sync: false
       - key: CAJERO2_INITIAL_PIN
         sync: false
+      # Google Drive: comprobantes de pago y facturas (mini script de Apps Script)
+      - key: DRIVE_SCRIPT_URL
+        sync: false
+      - key: DRIVE_SCRIPT_TOKEN
+        sync: false
+      # Datos que salen en la factura digital
+      - key: NEGOCIO_NOMBRE
+        value: Family Burger
+      - key: NEGOCIO_RIF
+        sync: false
+      - key: NEGOCIO_TEL
+        sync: false
+      - key: NEGOCIO_DIRECCION
+        sync: false
+      - key: FACTURA_PREFIJO
+        value: FB
