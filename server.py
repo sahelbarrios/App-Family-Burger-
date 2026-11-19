@@ -1,3 +1,4 @@
+```python
 """
 DOGGIPOS MULTISEDE & AUDITORÍA (FAST-FOOD) - VERSIÓN PRODUCCIÓN UNIFICADA
 Monolito Flask + PostgreSQL (Supabase Cloud) / SQLite Fallback + SPA Completa
@@ -45,10 +46,20 @@ app.config.update(
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 USE_POSTGRES = False
 
+PG_POOL = None
 if DATABASE_URL:
     try:
         import psycopg2
         import psycopg2.extras
+        from psycopg2 import pool as pg_pool
+        conn_str = DATABASE_URL
+        if "sslmode" not in conn_str:
+            conn_str += ("&" if "?" in conn_str else "?") + "sslmode=require"
+        try:
+            PG_POOL = pg_pool.ThreadedConnectionPool(1, 12, dsn=conn_str)
+        except Exception as pool_err:
+            print(f">> [WARN] No se pudo inicializar el pool PG ({pool_err}), usando conexión directa.")
+            PG_POOL = None
         USE_POSTGRES = True
         print(">> [PRODUCCIÓN] Conectado a PostgreSQL en la nube (Supabase/Render).")
     except Exception as e:
@@ -63,13 +74,24 @@ class DBWrapper:
     """Adaptador universal compatible con PostgreSQL (Supabase Cloud) y SQLite."""
     def __init__(self):
         self.is_pg = USE_POSTGRES
+        self._from_pool = False
         if self.is_pg:
-            conn_str = DATABASE_URL
-            if "sslmode" not in conn_str:
-                conn_str += ("&" if "?" in conn_str else "?") + "sslmode=require"
-            self.conn = psycopg2.connect(conn_str)
+            if PG_POOL is not None:
+                try:
+                    self.conn = PG_POOL.getconn()
+                    self._from_pool = True
+                except Exception:
+                    conn_str = DATABASE_URL
+                    if "sslmode" not in conn_str:
+                        conn_str += ("&" if "?" in conn_str else "?") + "sslmode=require"
+                    self.conn = psycopg2.connect(conn_str)
+            else:
+                conn_str = DATABASE_URL
+                if "sslmode" not in conn_str:
+                    conn_str += ("&" if "?" in conn_str else "?") + "sslmode=require"
+                self.conn = psycopg2.connect(conn_str)
         else:
-            self.conn = sqlite3.connect(DB_PATH)
+            self.conn = sqlite3.connect(DB_PATH, timeout=15.0)
             self.conn.row_factory = sqlite3.Row
 
     def _adapt_sql(self, sql):
@@ -115,7 +137,16 @@ class DBWrapper:
         self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        if self.is_pg and self._from_pool and PG_POOL is not None:
+            try:
+                PG_POOL.putconn(self.conn)
+                return
+            except Exception:
+                pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 def get_db():
     return DBWrapper()
@@ -184,6 +215,54 @@ NEGOCIO_TEL = os.environ.get("NEGOCIO_TEL", "")
 NEGOCIO_DESCRIPCION = os.environ.get("NEGOCIO_DESCRIPCION", "Mira el menú, aparta tu pedido y paga desde tu teléfono.")
 NEGOCIO_DIRECCION = os.environ.get("NEGOCIO_DIRECCION", "")
 FACTURA_PREFIJO = os.environ.get("FACTURA_PREFIJO", "FB")
+
+_NEG_CLAVES = {  # clave: (variable de entorno de respaldo, valor por defecto)
+    "nombre": ("NEGOCIO_NOMBRE", "Family Burger"), "razon_social": (None, ""), "rif": ("NEGOCIO_RIF", "J-00000000-0"),
+    "telefono": ("NEGOCIO_TEL", ""), "email": (None, ""), "direccion": ("NEGOCIO_DIRECCION", ""), "maps_url": (None, ""),
+    "horario": (None, ""), "prefijo": ("FACTURA_PREFIJO", "FB"),
+    "descripcion": ("NEGOCIO_DESCRIPCION", "Mira el menú, aparta tu pedido y paga desde tu teléfono."), "leyenda": (None, ""),
+}
+_NEG_CACHE = {"t": 0.0, "datos": {}}
+
+
+def _neg_cargar():
+    ahora = time.time()
+    if ahora - _NEG_CACHE["t"] < 20:
+        return _NEG_CACHE["datos"]
+    datos = _NEG_CACHE["datos"]
+    try:
+        d = get_db()
+        try:
+            datos = {r["clave"]: (r["valor"] or "") for r in d.execute("SELECT clave, valor FROM negocio_datos").fetchall()}
+        finally:
+            d.close()
+    except Exception as e:
+        print(f">> [WARN] No se pudieron leer los datos del negocio: {e}")
+    _NEG_CACHE["t"] = ahora
+    _NEG_CACHE["datos"] = datos
+    return datos
+
+
+def _neg(clave):
+    """Dato del negocio: primero lo guardado en el panel, si no la variable de Render, si no el valor por defecto."""
+    env, defecto = _NEG_CLAVES[clave]
+    v = str(_neg_cargar().get(clave) or "").strip()
+    if v:
+        return v
+    return os.environ.get(env, defecto) if env else defecto
+
+
+def _nn():
+    return _neg("nombre")
+
+
+def _ntel():
+    return _neg("telefono")
+
+
+def _ndesc():
+    return _neg("descripcion")
+
 ENTIDADES_ARCHIVO = {"orden": "ordenes", "compra": "compras", "pago_compra": "pagos_compra", "gasto": "gastos"}
 _firmador_factura = URLSafeSerializer(app.secret_key, salt="factura-publica")
 
@@ -289,7 +368,7 @@ PLANTILLA_FACTURA = r"""<!doctype html>
   <div class="top">
     <div>
       <h1>{{ negocio }}</h1>
-      <p>RIF: {{ rif }}{% if tel %} · Tel: {{ tel }}{% endif %}{% if direccion %}<br>{{ direccion }}{% endif %}{% if sede %}<br>{{ sede }}{% endif %}</p>
+      <p>{% if razon_social %}{{ razon_social }}<br>{% endif %}RIF: {{ rif }}{% if tel %} · Tel: {{ tel }}{% endif %}{% if email %} · {{ email }}{% endif %}{% if direccion %}<br>{{ direccion }}{% endif %}{% if sede %}<br>{{ sede }}{% endif %}</p>
     </div>
     <div class="num"><span>FACTURA</span><strong>{{ numero }}</strong><small>{{ fecha }}</small></div>
   </div>
@@ -319,7 +398,7 @@ PLANTILLA_FACTURA = r"""<!doctype html>
     {% if fiado %}<div class="pago"><b>Estado:</b> Pendiente de pago (crédito)<br><b>Saldo a pagar:</b> {{ total }}</div>{% endif %}
     {% if referencia %}<div class="pago"><b>Forma de pago:</b> Pago electrónico<br><b>Referencia:</b> {{ referencia }}</div>{% endif %}
   </div>
-  <div class="pie"><strong>¡Gracias por tu compra!</strong>Todos los montos están expresados en bolívares (Bs.)</div>
+  <div class="pie"><strong>¡Gracias por tu compra!</strong>Todos los montos están expresados en bolívares (Bs.){% if nota_tasa %}<br>{{ nota_tasa }}{% endif %}{% if leyenda %}<br>{{ leyenda }}{% endif %}</div>
 </div>
 <div class="btn"><button onclick="window.print()">Imprimir / Guardar PDF</button></div>
 </body></html>"""
@@ -339,6 +418,14 @@ def _datos_factura(db, oid):
         "FROM orden_items i LEFT JOIN catalogo_productos p ON p.id = i.producto_id "
         "WHERE i.orden_id = ? ORDER BY i.id", (oid,)).fetchall()
     tasa = float(o["tasa_aplicada"] or 0)
+    nota_tasa = ""
+    estado_f = str(o.get("estado_pago") or "").upper()
+    if estado_f == "FIADO":  # una cuenta por cobrar se valora a la tasa de HOY, no a la del día de la compra
+        tasa = _cfg_tasa(db)[0]
+        nota_tasa = f"Cuenta por cobrar: los montos en bolívares están calculados a la tasa de hoy (Bs {fmt_bs(tasa)} por $1) y pueden cambiar hasta que se pague."
+    elif o.get("tasa_cobro"):
+        tasa = float(o["tasa_cobro"])
+        nota_tasa = f"Montos a la tasa del día del pago (Bs {fmt_bs(tasa)} por $1)."
     lineas = []
     for r in filas:
         r = dict(r)
@@ -351,9 +438,10 @@ def _datos_factura(db, oid):
     estado = str(o.get("estado_pago") or "").upper()
     dt = a_local(o.get("created_at"))
     return {
-        "negocio": NEGOCIO_NOMBRE, "rif": NEGOCIO_RIF, "tel": NEGOCIO_TEL, "direccion": NEGOCIO_DIRECCION,
+        "negocio": _nn(), "rif": _neg("rif"), "tel": _ntel(), "direccion": _neg("direccion"),
+        "razon_social": _neg("razon_social"), "email": _neg("email"), "leyenda": _neg("leyenda"), "nota_tasa": nota_tasa,
         "sede": o.get("sede_nombre"),
-        "numero": f"{FACTURA_PREFIJO}-{int(o['id']):06d}",
+        "numero": f"{_neg('prefijo')}-{int(o['id']):06d}",
         "fecha": dt.strftime("%d/%m/%Y %I:%M %p") if dt else "",
         "cliente": o.get("cliente_nombre"), "cliente_tel": o.get("cliente_telefono"),
         "cajero": o.get("cajero_nombre"), "lineas": lineas,
@@ -361,7 +449,8 @@ def _datos_factura(db, oid):
         "pagado": fmt_bs(pagado) if pagado > 0.004 else "",
         "vuelto": fmt_bs(vuelto) if vuelto > 0.004 else "",
         "referencia": o.get("referencia_pago") or "",
-        "anulada": estado == "ANULADA", "fiado": estado == "FIADO",
+        "anulada": estado == "ANULADA" and o.get("estado_web") not in ("PENDIENTE_PAGO", "PAGO_REPORTADO"),
+        "fiado": estado == "FIADO",
         "_telefono": o.get("cliente_telefono") or "",
     }
 
@@ -406,6 +495,68 @@ def _crear_usuario_web():
         print(f">> [WARN] No se pudo crear el usuario interno de pedidos web: {e}")
     finally:
         db.close()
+
+
+def _migraciones_caja(db):
+    """Datos del negocio, ajustes de caja y la tasa con que se hizo cada gasto o pago a proveedor."""
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS negocio_datos (clave TEXT PRIMARY KEY, valor TEXT)",
+        """CREATE TABLE IF NOT EXISTS caja_movimientos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sede_id INTEGER,
+            moneda TEXT NOT NULL,
+            monto DOUBLE PRECISION NOT NULL,
+            motivo TEXT,
+            fecha TEXT NOT NULL,
+            usuario_id INTEGER,
+            created_at TEXT
+        )""",
+    ]:
+        try:
+            db.execute(ddl)
+            db.commit()
+        except Exception as e:
+            db.conn.rollback()
+            print(f">> [WARN] No se pudo crear una tabla de caja/negocio: {e}")
+    for tabla, col in [
+        ("gastos", "tasa"), ("pagos_compra", "tasa"), ("gastos", "monto_bs"), ("pagos_compra", "monto_bs"), ("ordenes", "tasa_cobro"),
+        ("turnos_caja", "fondo_inicial_bs"), ("turnos_caja", "efectivo_declarado_cierre_bs"), ("turnos_caja", "diferencia_arqueo_bs"),
+    ]:
+        try:
+            db.execute(f"SELECT {col} FROM {tabla} LIMIT 1")
+            db.commit()
+        except Exception:
+            db.conn.rollback()
+            try:
+                db.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} DOUBLE PRECISION")
+                db.commit()
+            except Exception as e:
+                db.conn.rollback()
+                print(f">> [WARN] No se pudo agregar {tabla}.{col}: {e}")
+    try:
+        try:
+            db.execute("SELECT notas_cierre FROM turnos_caja LIMIT 1")
+            db.commit()
+        except Exception:
+            db.conn.rollback()
+            try:
+                db.execute("ALTER TABLE turnos_caja ADD COLUMN notas_cierre TEXT")
+                db.commit()
+            except Exception:
+                db.conn.rollback()
+        if USE_POSTGRES:
+            try:
+                db.execute("ALTER TABLE ordenes DROP CONSTRAINT IF EXISTS ordenes_estado_cocina_check")
+                db.execute("ALTER TABLE ordenes ADD CONSTRAINT ordenes_estado_cocina_check CHECK (estado_cocina IN ('PREPARANDO', 'LISTO', 'ENTREGADO'))")
+                db.commit()
+            except Exception:
+                db.conn.rollback()
+        if not db.execute("SELECT clave FROM negocio_datos WHERE clave = 'maps_url'").fetchone():
+            db.execute("INSERT INTO negocio_datos (clave, valor) VALUES (?, ?)", ("maps_url", "https://maps.app.goo.gl/QdWVuWT6UAXJepnk6"))
+            db.commit()
+    except Exception as e:
+        db.conn.rollback()
+        print(f">> [WARN] No se pudo guardar la ubicación inicial: {e}")
 
 
 def _migraciones_admin(db):
@@ -498,11 +649,38 @@ def _migraciones_admin(db):
             db.execute("ALTER TABLE auditoria_logs DROP CONSTRAINT IF EXISTS auditoria_logs_accion_check")
             db.execute("ALTER TABLE auditoria_logs ADD CONSTRAINT auditoria_logs_accion_check CHECK (accion IN ("
                        "'ANULAR_ORDEN','EDITAR_ORDEN','AJUSTE_STOCK','CAMBIO_PRECIO','MERMA_DECLARADA','TRANSFERENCIA',"
-                       "'GESTION_USUARIO','GESTION_SEDE','EDITAR_PRODUCTO','GASTO','COMPRA_PROVEEDOR','PAGO_PROVEEDOR'))")
+                       "'GESTION_USUARIO','GESTION_SEDE','EDITAR_PRODUCTO','GASTO','COMPRA_PROVEEDOR','PAGO_PROVEEDOR','REINICIO_SISTEMA'))")
             db.commit()
         except Exception as e:
             db.conn.rollback()
             print(f">> [WARN] No se pudo ampliar el constraint de auditoría ({e}).")
+        try:
+            db.execute("ALTER TABLE ordenes DROP CONSTRAINT IF EXISTS ordenes_estado_pago_check")
+            db.execute("ALTER TABLE ordenes ADD CONSTRAINT ordenes_estado_pago_check CHECK (estado_pago IN ('PAGADA', 'FIADO', 'ANULADA', 'PENDIENTE'))")
+            db.commit()
+        except Exception as e:
+            db.conn.rollback()
+            print(f">> [WARN] No se pudo ampliar el constraint de estado_pago ({e}).")
+
+    indices_sql = [
+        "CREATE INDEX IF NOT EXISTS idx_ordenes_sede_created ON ordenes (sede_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ordenes_estado_web_venc ON ordenes (estado_web, vencimiento)",
+        "CREATE INDEX IF NOT EXISTS idx_ordenes_estado_pago ON ordenes (estado_pago)",
+        "CREATE INDEX IF NOT EXISTS idx_ordenes_ref_pago ON ordenes (referencia_pago)",
+        "CREATE INDEX IF NOT EXISTS idx_orden_items_orden_id ON orden_items (orden_id)",
+        "CREATE INDEX IF NOT EXISTS idx_kardex_sede_insumo ON movimientos_kardex (sede_id, insumo_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_archivos_entidad ON archivos (entidad, entidad_id)",
+        "CREATE INDEX IF NOT EXISTS idx_gastos_fecha_sede ON gastos (fecha, sede_id)",
+        "CREATE INDEX IF NOT EXISTS idx_compras_proveedor ON compras (proveedor_id, anulada)",
+        "CREATE INDEX IF NOT EXISTS idx_pagos_compra_id ON pagos_compra (compra_id)",
+    ]
+    for idx_q in indices_sql:
+        try:
+            db.execute(idx_q)
+            db.commit()
+        except Exception as e:
+            db.conn.rollback()
+            print(f">> [WARN] No se pudo crear índice ({e}).")
 
 
 def init_db():
@@ -675,6 +853,7 @@ def init_db():
     db.commit()
     _migraciones_admin(db)
     _migraciones_pedidos(db)
+    _migraciones_caja(db)
 
     # El kardex debe aceptar el tipo AJUSTE (conteo físico).
     global KARDEX_ACEPTA_AJUSTE, FLAG_TRUE, FLAG_FALSE
@@ -913,16 +1092,28 @@ def limpiar_mods(mods):
 
 
 def ajustar_stock(db, sede_id, insumo_id, delta, permitir_negativo=False):
+    inicial = float(delta) if permitir_negativo else max(0.0, float(delta))
+    if db.is_pg:
+        exp = "inventario_por_sede.stock_actual + %s"
+        if not permitir_negativo:
+            exp = f"GREATEST(0, {exp})"
+        cur = db.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"INSERT INTO inventario_por_sede (sede_id, insumo_id, stock_actual) VALUES (%s, %s, %s) "
+            f"ON CONFLICT (sede_id, insumo_id) DO UPDATE SET stock_actual = {exp}, updated_at = NOW() "
+            f"RETURNING stock_actual",
+            (sede_id, insumo_id, inicial, float(delta)),
+        )
+        fila = cur.fetchone()
+        return float(fila["stock_actual"]) if fila else inicial
+    exp_sqlite = "inventario_por_sede.stock_actual + ?" if permitir_negativo else "MAX(0.0, inventario_por_sede.stock_actual + ?)"
+    db.execute(
+        f"INSERT INTO inventario_por_sede (sede_id, insumo_id, stock_actual) VALUES (?, ?, ?) "
+        f"ON CONFLICT(sede_id, insumo_id) DO UPDATE SET stock_actual = {exp_sqlite}",
+        (sede_id, insumo_id, inicial, float(delta)),
+    )
     row = db.execute("SELECT stock_actual FROM inventario_por_sede WHERE sede_id = ? AND insumo_id = ?", (sede_id, insumo_id)).fetchone()
-    if row is None:
-        nuevo = delta if permitir_negativo else max(0.0, delta)
-        db.execute("INSERT INTO inventario_por_sede (sede_id, insumo_id, stock_actual) VALUES (?, ?, ?)", (sede_id, insumo_id, nuevo))
-        return nuevo
-    nuevo = float(row["stock_actual"]) + delta
-    if not permitir_negativo:
-        nuevo = max(0.0, nuevo)
-    db.execute("UPDATE inventario_por_sede SET stock_actual = ? WHERE sede_id = ? AND insumo_id = ?", (nuevo, sede_id, insumo_id))
-    return nuevo
+    return float(row["stock_actual"]) if row else inicial
 
 
 def _datos_usuario(u):
@@ -1040,7 +1231,24 @@ def api_init():
             "SELECT oi.* FROM orden_items oi JOIN (SELECT id FROM ordenes WHERE sede_id = ? ORDER BY id DESC LIMIT 1500) o ON o.id = oi.orden_id",
             (g.user["sede_id"],)).fetchall()]
     todos_nombres = {u["id"]: u["nombre"] for u in db.execute("SELECT id, nombre FROM usuarios").fetchall()}
-    logs_rows = [dict(l) for l in db.execute("SELECT * FROM auditoria_logs ORDER BY id DESC LIMIT 50").fetchall()] if es_super else []
+    logs_rows = []
+    turnos_cerrados = []
+    if es_super:
+        for l in db.execute("SELECT * FROM auditoria_logs ORDER BY id DESC LIMIT 50").fetchall():
+            ld = dict(l)
+            dt_l = a_local(ld.get("created_at"))
+            ld["created_at"] = dt_l.strftime("%Y-%m-%d %H:%M") if dt_l else str(ld.get("created_at") or "")
+            logs_rows.append(ld)
+        for tc in db.execute("SELECT id, sede_id, cajero_id, cierre_at, diferencia_arqueo_usd, diferencia_arqueo_bs FROM turnos_caja WHERE estado = 'CERRADO' ORDER BY id DESC LIMIT 500").fetchall():
+            dt_tc = a_local(tc["cierre_at"])
+            turnos_cerrados.append({
+                "id": tc["id"],
+                "sede_id": tc["sede_id"],
+                "cajero_id": tc["cajero_id"],
+                "fecha_corta": dt_tc.strftime("%Y-%m-%d") if dt_tc else "",
+                "diferencia_arqueo_usd": float(tc["diferencia_arqueo_usd"] or 0),
+                "diferencia_arqueo_bs": float(tc["diferencia_arqueo_bs"] or 0),
+            })
     archivos_por_orden = {}
     if ordenes_rows:
         desde_id = min(o["id"] for o in ordenes_rows)
@@ -1140,7 +1348,8 @@ def api_init():
         "inventario_sedes": inv_map,
         "metodos_qr": qrs,
         "ordenes": ordenes_list,
-        "auditoria_logs": logs_rows
+        "auditoria_logs": logs_rows,
+        "turnos_cerrados": turnos_cerrados
     })
 
 @app.route("/api/tasa/sync", methods=["POST"])
@@ -1263,15 +1472,20 @@ def api_orden_crear():
         return jsonify({"success": False, "error": "Orden vacía"}), 400
 
     ahora_str = ahora_utc_str()
+    turno_row = db.execute(
+        "SELECT id FROM turnos_caja WHERE cajero_id = ? AND sede_id = ? AND estado = 'ABIERTO' ORDER BY id DESC LIMIT 1",
+        (cajero_id, sede_id),
+    ).fetchone()
+    turno_id = turno_row["id"] if turno_row else None
     orden_id = db.insert_returning_id("""
         INSERT INTO ordenes (
-            sede_id, cajero_id, cliente_nombre, cliente_telefono,
+            turno_id, sede_id, cajero_id, cliente_nombre, cliente_telefono,
             total_venta_usd, costo_insumos_usd, tasa_aplicada, tasa_reposicion_momento,
             recibido_usd, recibido_bs, vuelto_usd, vuelto_bs,
             estado_pago, estado_cocina, notas_cocina, referencia_pago, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARANDO', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARANDO', ?, ?, ?)
     """, (
-        sede_id, cajero_id, cliente_nombre, cliente_telefono,
+        turno_id, sede_id, cajero_id, cliente_nombre, cliente_telefono,
         total_venta_usd, costo_total_insumos_usd, tasa_aplicada, tasa_reposicion,
         recibido_usd, recibido_bs, vuelto_usd, vuelto_bs,
         estado_pago, notas_cocina, referencia_pago, ahora_str
@@ -1283,12 +1497,13 @@ def api_orden_crear():
             VALUES (?, ?, ?, ?, ?, ?)
         """, (orden_id, p_id, cant, p_precio, c_unit, mods_json))
 
-    for iid, cant_desc in desglose_insumos.items():
-        ajustar_stock(db, sede_id, iid, -cant_desc, permitir_negativo=True)
-        db.execute("""
-            INSERT INTO movimientos_kardex (sede_id, insumo_id, usuario_id, tipo, cantidad, costo_unitario_momento, motivo, created_at)
-            VALUES (?, ?, ?, 'VENTA', ?, ?, ?, ?)
-        """, (sede_id, iid, cajero_id, -cant_desc, insumos_map.get(iid, 0.0), f"Venta Orden #{orden_id}", ahora_str))
+    with _LOCK_RESERVA:
+        for iid, cant_desc in desglose_insumos.items():
+            ajustar_stock(db, sede_id, iid, -cant_desc, permitir_negativo=True)
+            db.execute("""
+                INSERT INTO movimientos_kardex (sede_id, insumo_id, usuario_id, tipo, cantidad, costo_unitario_momento, motivo, created_at)
+                VALUES (?, ?, ?, 'VENTA', ?, ?, ?, ?)
+            """, (sede_id, iid, cajero_id, -cant_desc, insumos_map.get(iid, 0.0), f"Venta Orden #{orden_id}", ahora_str))
 
     db.commit()
     db.close()
@@ -1310,7 +1525,7 @@ def api_orden_estado():
         db.close()
         return jsonify({"success": False, "error": "Esa orden es de otra sede."}), 403
     if estado_cocina:
-        if estado_cocina not in ("PREPARANDO", "ENTREGADO"):
+        if estado_cocina not in ("PREPARANDO", "LISTO", "ENTREGADO"):
             db.close()
             return jsonify({"success": False, "error": "Estado de cocina inválido"}), 400
         db.execute("UPDATE ordenes SET estado_cocina = ? WHERE id = ?", (estado_cocina, orden_id))
@@ -1319,8 +1534,16 @@ def api_orden_estado():
         if estado_pago != "PAGADA" or orden["estado_pago"] != "FIADO":
             db.close()
             return jsonify({"success": False, "error": "Cambio de estado de pago no permitido"}), 400
+        metodo_cobro = str(data.get("metodo_cobro", ""))[:40]
         db.execute("UPDATE ordenes SET estado_pago = ?, cobrado_at = ?, metodo_cobro = ? WHERE id = ?",
-                   (estado_pago, ahora_utc_str(), str(data.get("metodo_cobro", ""))[:40], orden_id))
+                   (estado_pago, ahora_utc_str(), metodo_cobro, orden_id))
+        total_fiado = float(db.execute("SELECT total_venta_usd FROM ordenes WHERE id = ?", (orden_id,)).fetchone()["total_venta_usd"])
+        db.execute("UPDATE ordenes SET tasa_cobro = ? WHERE id = ?", (_cfg_tasa(db)[0], orden_id))
+        if _es_metodo_usd(metodo_cobro):
+            db.execute("UPDATE ordenes SET recibido_usd = ? WHERE id = ? AND recibido_usd = 0 AND recibido_bs = 0", (total_fiado, orden_id))
+        else:  # se cobra en bolívares a la tasa del día del cobro
+            db.execute("UPDATE ordenes SET recibido_bs = ? WHERE id = ? AND recibido_usd = 0 AND recibido_bs = 0",
+                       (round(total_fiado * _cfg_tasa(db)[0], 2), orden_id))
     db.commit()
     db.close()
     return jsonify({"success": True})
@@ -1351,21 +1574,31 @@ def api_auditoria_corregir():
         return jsonify({"success": False, "error": "Ya está anulada"}), 400
 
     sede_id = orden_dict["sede_id"]
-    items = db.execute("SELECT * FROM orden_items WHERE orden_id = ?", (orden_id,)).fetchall()
     insumos_rev = {}
-    for it in items:
-        boms = db.execute("SELECT insumo_id, cantidad_consumida FROM recetas_bom WHERE producto_id = ?", (it["producto_id"],)).fetchall()
-        for b in boms:
-            iid = b["insumo_id"]
-            insumos_rev[iid] = insumos_rev.get(iid, 0.0) + (float(b["cantidad_consumida"]) * int(it["cantidad"]))
+    kardex_orig = db.execute(
+        "SELECT insumo_id, cantidad FROM movimientos_kardex WHERE sede_id = ? AND tipo = 'VENTA' AND motivo IN (?, ?)",
+        (sede_id, f"Venta Orden #{orden_id}", f"Reserva pedido web #{orden_id}"),
+    ).fetchall()
+    if kardex_orig:
+        for k in kardex_orig:
+            iid = k["insumo_id"]
+            insumos_rev[iid] = insumos_rev.get(iid, 0.0) + abs(float(k["cantidad"]))
+    else:
+        items = db.execute("SELECT * FROM orden_items WHERE orden_id = ?", (orden_id,)).fetchall()
+        for it in items:
+            boms = db.execute("SELECT insumo_id, cantidad_consumida FROM recetas_bom WHERE producto_id = ?", (it["producto_id"],)).fetchall()
+            for b in boms:
+                iid = b["insumo_id"]
+                insumos_rev[iid] = insumos_rev.get(iid, 0.0) + (float(b["cantidad_consumida"]) * int(it["cantidad"]))
 
     ahora_str = ahora_utc_str()
-    for iid, cant_ret in insumos_rev.items():
-        db.execute("UPDATE inventario_por_sede SET stock_actual = stock_actual + ? WHERE sede_id = ? AND insumo_id = ?", (cant_ret, sede_id, iid))
-        db.execute("""
-            INSERT INTO movimientos_kardex (sede_id, insumo_id, usuario_id, tipo, cantidad, costo_unitario_momento, motivo, created_at)
-            VALUES (?, ?, ?, 'REVERSION_AUDITORIA', ?, 0, ?, ?)
-        """, (sede_id, iid, superusuario_id, cant_ret, f"Reversión Orden #{orden_id}: {justificacion}", ahora_str))
+    with _LOCK_RESERVA:
+        for iid, cant_ret in insumos_rev.items():
+            ajustar_stock(db, sede_id, iid, cant_ret, permitir_negativo=True)
+            db.execute("""
+                INSERT INTO movimientos_kardex (sede_id, insumo_id, usuario_id, tipo, cantidad, costo_unitario_momento, motivo, created_at)
+                VALUES (?, ?, ?, 'REVERSION_AUDITORIA', ?, 0, ?, ?)
+            """, (sede_id, iid, superusuario_id, cant_ret, f"Reversión Orden #{orden_id}: {justificacion}", ahora_str))
 
     db.execute("UPDATE ordenes SET estado_pago = 'ANULADA' WHERE id = ?", (orden_id,))
     db.execute("""
@@ -1376,6 +1609,47 @@ def api_auditoria_corregir():
     db.commit()
     db.close()
     return jsonify({"success": True})
+
+def _registrar_pago_inventario(db, ins, sede_id, cant, motivo, data):
+    """El dinero de reponer inventario sale de la caja: queda como pago a proveedor (con deuda si falta pagar) o como gasto."""
+    moneda = str(data.get("moneda") or "USD").upper()
+    if moneda not in ("USD", "BS"):
+        raise ValueError("Elige la moneda con la que pagaste.")
+    tasa = _cfg_tasa(db)[0]
+    a_usd = (lambda x: x) if moneda == "USD" else (lambda x: x / tasa)
+    total = a_usd(_num(data.get("total_pagado"), "El total de la compra", 0.01))
+    bruto = data.get("pagado_ahora")
+    pagado_in = _num(bruto if bruto not in (None, "") else data.get("total_pagado"), "Lo pagado ahora", 0)
+    pagado = a_usd(pagado_in)
+    if pagado > total + 0.004:
+        raise ValueError("Lo pagado ahora no puede ser mayor que el total de la compra.")
+    metodo = str(data.get("metodo") or ("Efectivo USD" if moneda == "USD" else "Efectivo Bs"))[:40]
+    pagado_bs = round(pagado_in, 2) if (moneda == "BS" and not _es_metodo_usd(metodo)) else None
+    fecha = hoy_local().isoformat()
+    desc = (f'{ins["nombre"]} x{cant:g}' + (f': {motivo}' if motivo else ""))[:200]
+    ahora = ahora_utc_str()
+    prov = int(data.get("proveedor_id") or 0)
+    if prov:
+        if not db.execute("SELECT id FROM proveedores WHERE id = ?", (prov,)).fetchone():
+            raise ValueError("Proveedor no encontrado.")
+        cid = db.insert_returning_id(
+            "INSERT INTO compras (proveedor_id, sede_id, descripcion, total_usd, pagado_usd, estado, fecha, usuario_id, anulada, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (prov, sede_id, desc, total, pagado, _estado_compra(total, pagado), fecha, g.user["id"], ahora))
+        if pagado > 0.004:
+            db.execute("INSERT INTO pagos_compra (compra_id, monto_usd, metodo, nota, fecha, usuario_id, created_at, tasa, monto_bs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (cid, pagado, metodo, "Pago al reponer inventario", fecha, g.user["id"], ahora, tasa, pagado_bs))
+        log_auditoria(db, "COMPRA_PROVEEDOR", "compras", cid, None, {"proveedor_id": prov, "total_usd": round(total, 2), "pagado_usd": round(pagado, 2)}, desc, sede_id)
+    else:
+        if pagado < total - 0.004:
+            raise ValueError("Si no pagaste todo, elige el proveedor al que le debes el resto.")
+        categoria = _registrar_categoria(db, "Compra de inventario")
+        gid = db.insert_returning_id(
+            "INSERT INTO gastos (sede_id, categoria, descripcion, monto_usd, metodo, proveedor_id, fecha, usuario_id, anulado, created_at, tasa, monto_bs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            (sede_id, categoria, desc, total, metodo, None, fecha, g.user["id"], ahora, tasa, pagado_bs))
+        log_auditoria(db, "GASTO", "gastos", gid, None, {"categoria": categoria, "monto_usd": round(total, 2), "fecha": fecha}, desc, sede_id)
+
 
 @app.route("/api/inventario/movimiento", methods=["POST"])
 @requiere_login()
@@ -1389,6 +1663,7 @@ def api_inventario_movimiento():
         return jsonify({"success": False, "error": "Solo el superusuario puede registrar compras, ajustes o transferencias."}), 403
 
     db = get_db()
+    _LOCK_RESERVA.acquire()
     try:
         insumo_id = int(data.get("insumo_id") or 0)
         sede_id = int(data.get("sede_id") or 0) if es_super else int(g.user["sede_id"] or 0)
@@ -1419,10 +1694,20 @@ def api_inventario_movimiento():
             cp = data.get("costo_paquete_usd")
             if cp not in (None, ""):
                 cp = _num(cp, "El costo del paquete", 0.0001)
-                costo = cp / float(ins["rendimiento_paquete"])
-                db.execute("UPDATE insumos_maestro SET costo_paquete_usd = ?, costo_unitario_usd = ? WHERE id = ?", (cp, costo, insumo_id))
+                costo_nuevo = cp / float(ins["rendimiento_paquete"])
+                st_tot_row = db.execute("SELECT COALESCE(SUM(CASE WHEN stock_actual > 0 THEN stock_actual ELSE 0 END), 0) AS st FROM inventario_por_sede WHERE insumo_id = ?", (insumo_id,)).fetchone()
+                stock_previo_global = float(st_tot_row["st"] if isinstance(st_tot_row, dict) else st_tot_row[0])
+                costo_previo = float(ins["costo_unitario_usd"] or 0.0)
+                if stock_previo_global > 0 and costo_previo > 0:
+                    costo_cpp = round((stock_previo_global * costo_previo + cant * costo_nuevo) / (stock_previo_global + cant), 4)
+                else:
+                    costo_cpp = round(costo_nuevo, 4)
+                costo = costo_nuevo
+                db.execute("UPDATE insumos_maestro SET costo_paquete_usd = ?, costo_unitario_usd = ? WHERE id = ?", (cp, costo_cpp, insumo_id))
             ajustar_stock(db, sede_id, insumo_id, cant)
             kardex(sede_id, "COMPRA", cant, motivo or "Compra / entrada de mercancía")
+            if data.get("total_pagado") not in (None, ""):
+                _registrar_pago_inventario(db, ins, sede_id, cant, motivo, data)
 
         elif tipo == "TRANSFERENCIA":
             cant = _num(data.get("cantidad"), "La cantidad", 0.0001)
@@ -1462,6 +1747,7 @@ def api_inventario_movimiento():
         print(f">> [ERROR] inventario/movimiento: {e}")
         return jsonify({"success": False, "error": "Error interno al registrar el movimiento."}), 500
     finally:
+        _LOCK_RESERVA.release()
         db.close()
 
 
@@ -2043,6 +2329,7 @@ def api_admin_proveedor_editar(db, pid):
 @admin_api
 def api_admin_compras(db):
     if request.method == "GET":
+        tasa_hoy = _cfg_tasa(db)[0]
         solo_deuda = request.args.get("estado", "pendientes") != "todas"
         sql = ("SELECT c.*, p.nombre AS proveedor FROM compras c LEFT JOIN proveedores p ON p.id = c.proveedor_id "
                "WHERE c.anulada = 0")
@@ -2053,9 +2340,9 @@ def api_admin_compras(db):
         if filas:
             ids = [f["id"] for f in filas]
             marcas = ",".join("?" for _ in ids)
-            for r in db.execute(f"SELECT compra_id, monto_usd, metodo, nota, fecha FROM pagos_compra WHERE compra_id IN ({marcas}) ORDER BY id", tuple(ids)).fetchall():
-                pagos.setdefault(r["compra_id"], []).append({"monto_usd": float(r["monto_usd"]), "metodo": r["metodo"] or "", "nota": r["nota"] or "", "fecha": str(r["fecha"])[:10]})
-        return jsonify({"success": True, "compras": [{
+            for r in db.execute(f"SELECT id, compra_id, monto_usd, monto_bs, tasa, metodo, nota, fecha FROM pagos_compra WHERE compra_id IN ({marcas}) ORDER BY id", tuple(ids)).fetchall():
+                pagos.setdefault(r["compra_id"], []).append({"id": r["id"], "monto_usd": float(r["monto_usd"]), "metodo": r["metodo"] or "", "nota": r["nota"] or "", "fecha": str(r["fecha"])[:10], "bs": _bs_de_pago(r, tasa_hoy)})
+        return jsonify({"success": True, "tasa": tasa_hoy, "compras": [{
             "id": f["id"], "proveedor_id": f["proveedor_id"], "proveedor": f["proveedor"] or "—", "sede_id": f["sede_id"],
             "descripcion": f["descripcion"] or "", "total_usd": float(f["total_usd"]), "pagado_usd": float(f["pagado_usd"]),
             "saldo_usd": round(float(f["total_usd"]) - float(f["pagado_usd"]), 2), "estado": f["estado"],
@@ -2065,8 +2352,19 @@ def api_admin_compras(db):
     prov = _entero(data.get("proveedor_id"), "El proveedor")
     if not db.execute("SELECT id FROM proveedores WHERE id = ?", (prov,)).fetchone():
         raise ValueError("Proveedor no encontrado.")
-    total = _num(data.get("total_usd"), "El total de la compra", 0.01)
-    pagado = _num(data.get("pagado_usd") or 0, "El monto pagado", 0)
+    tasa_c = _cfg_tasa(db)[0]
+    metodo_c = str(data.get("metodo", ""))[:40]
+    if data.get("total_bs") not in (None, ""):
+        total = max(0.01, round(_num(data.get("total_bs"), "El total en bolívares", 0.01) / tasa_c, 2))
+    else:
+        total = _num(data.get("total_usd"), "El total de la compra", 0.01)
+    pagado_bs = None
+    if data.get("pagado_bs") not in (None, ""):
+        bs_val = round(_num(data.get("pagado_bs"), "El monto pagado en bolívares", 0), 2)
+        pagado = round(bs_val / tasa_c, 2)
+        pagado_bs = None if _es_metodo_usd(metodo_c) else bs_val
+    else:
+        pagado = _num(data.get("pagado_usd") or 0, "El monto pagado", 0)
     if pagado > total + 0.004:
         raise ValueError("Lo pagado no puede ser mayor que el total de la compra.")
     sede = _entero(data.get("sede_id"), "La sede", False)
@@ -2077,8 +2375,8 @@ def api_admin_compras(db):
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
         (prov, sede, desc, total, pagado, _estado_compra(total, pagado), fecha, g.user["id"], ahora_utc_str()))
     if pagado > 0.004:
-        db.execute("INSERT INTO pagos_compra (compra_id, monto_usd, metodo, nota, fecha, usuario_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (cid, pagado, str(data.get("metodo", ""))[:40], "Pago inicial", fecha, g.user["id"], ahora_utc_str()))
+        db.execute("INSERT INTO pagos_compra (compra_id, monto_usd, metodo, nota, fecha, usuario_id, created_at, tasa, monto_bs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (cid, pagado, metodo_c, "Pago inicial", fecha, g.user["id"], ahora_utc_str(), tasa_c, pagado_bs))
     log_auditoria(db, "COMPRA_PROVEEDOR", "compras", cid, None, {"proveedor_id": prov, "total_usd": total, "pagado_usd": pagado}, desc or "Compra a proveedor", sede)
     return jsonify({"success": True, "id": cid})
 
@@ -2092,13 +2390,16 @@ def api_admin_compra_pago(db, cid):
     if not c:
         raise ValueError("Compra no encontrada.")
     saldo = float(c["total_usd"]) - float(c["pagado_usd"])
-    monto = _num(data.get("monto_usd"), "El monto del abono", 0.01)
-    if monto > saldo + 0.004:
+    metodo_p = str(data.get("metodo", ""))[:40]
+    tasa_p = _cfg_tasa(db)[0]
+    monto, monto_bs = _montos_pago(data, metodo_p, tasa_p, nombre="El monto del abono")
+    if monto > saldo + 0.01:
         raise ValueError(f"El abono ({monto:.2f}) es mayor que el saldo pendiente ({saldo:.2f}).")
+    monto = min(monto, saldo)  # evita centavos de más por el redondeo al convertir bolívares
     nuevo = float(c["pagado_usd"]) + monto
     fecha = _fecha(data.get("fecha"))
-    db.execute("INSERT INTO pagos_compra (compra_id, monto_usd, metodo, nota, fecha, usuario_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-               (cid, monto, str(data.get("metodo", ""))[:40], str(data.get("nota", ""))[:200], fecha, g.user["id"], ahora_utc_str()))
+    db.execute("INSERT INTO pagos_compra (compra_id, monto_usd, metodo, nota, fecha, usuario_id, created_at, tasa, monto_bs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (cid, monto, metodo_p, str(data.get("nota", ""))[:200], fecha, g.user["id"], ahora_utc_str(), tasa_p, monto_bs))
     db.execute("UPDATE compras SET pagado_usd = ?, estado = ? WHERE id = ?", (nuevo, _estado_compra(float(c["total_usd"]), nuevo), cid))
     log_auditoria(db, "PAGO_PROVEEDOR", "compras", cid, {"pagado_usd": float(c["pagado_usd"])}, {"pagado_usd": nuevo}, f"Abono de {monto:.2f} USD")
     return jsonify({"success": True, "saldo_usd": round(float(c["total_usd"]) - nuevo, 2)})
@@ -2131,6 +2432,7 @@ def api_admin_gastos(db):
         desde = _fecha(request.args.get("desde"), (hoy - datetime.timedelta(days=29)).isoformat())
         hasta = _fecha(request.args.get("hasta"), hoy.isoformat())
         sede = _entero(request.args.get("sede_id"), "La sede", False)
+        tasa_hoy = _cfg_tasa(db)[0]
         sql = "SELECT * FROM gastos WHERE anulado = 0 AND fecha >= ? AND fecha <= ?"
         par = [desde, hasta]
         if sede:
@@ -2138,27 +2440,504 @@ def api_admin_gastos(db):
             par.append(sede)
         filas = db.execute(sql + " ORDER BY fecha DESC, id DESC LIMIT 500", tuple(par)).fetchall()
         cats, propias = _categorias_gasto(db)
-        return jsonify({"success": True, "categorias": cats, "categorias_propias": propias, "metodos": METODOS_PAGO,
+        return jsonify({"success": True, "tasa": tasa_hoy, "categorias": cats, "categorias_propias": propias, "metodos": METODOS_PAGO,
                         "total_usd": round(sum(float(r["monto_usd"]) for r in filas), 2),
                         "gastos": [{"id": r["id"], "sede_id": r["sede_id"], "categoria": r["categoria"], "descripcion": r["descripcion"] or "",
-                                    "monto_usd": float(r["monto_usd"]), "metodo": r["metodo"] or "", "fecha": str(r["fecha"])[:10]} for r in filas]})
+                                    "monto_usd": float(r["monto_usd"]), "metodo": r["metodo"] or "", "fecha": str(r["fecha"])[:10],
+                                    "bs": _bs_de_pago(r, tasa_hoy)} for r in filas]})
 
     data = _json_body()
     categoria = str(data.get("categoria", "")).strip()[:60]
     if not categoria:
         raise ValueError("Elige una categoría para el gasto.")
     categoria = _registrar_categoria(db, categoria)  # si es nueva, queda guardada para la próxima
-    monto = _num(data.get("monto_usd"), "El monto", 0.01)
+    metodo_g = str(data.get("metodo", ""))[:40]
+    tasa_g = _cfg_tasa(db)[0]
+    monto, monto_bs = _montos_pago(data, metodo_g, tasa_g)
     sede = _entero(data.get("sede_id"), "La sede", False)
     fecha = _fecha(data.get("fecha"))
     desc = str(data.get("descripcion", "")).strip()[:200]
     gid = db.insert_returning_id(
-        "INSERT INTO gastos (sede_id, categoria, descripcion, monto_usd, metodo, proveedor_id, fecha, usuario_id, anulado, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-        (sede, categoria, desc, monto, str(data.get("metodo", ""))[:40], _entero(data.get("proveedor_id"), "El proveedor", False),
-         fecha, g.user["id"], ahora_utc_str()))
+        "INSERT INTO gastos (sede_id, categoria, descripcion, monto_usd, metodo, proveedor_id, fecha, usuario_id, anulado, created_at, tasa, monto_bs) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        (sede, categoria, desc, monto, metodo_g, _entero(data.get("proveedor_id"), "El proveedor", False),
+         fecha, g.user["id"], ahora_utc_str(), tasa_g, monto_bs))
     log_auditoria(db, "GASTO", "gastos", gid, None, {"categoria": categoria, "monto_usd": monto, "fecha": fecha}, desc or categoria, sede)
     return jsonify({"success": True, "id": gid})
+
+
+def _tienda_abierta():
+    return str(_neg_cargar().get("tienda_abierta", "1")).strip() != "0"
+
+
+def _guardar_negocio_valor(db, clave, valor):
+    cur = db.execute("UPDATE negocio_datos SET valor = ? WHERE clave = ?", (valor, clave))
+    if cur.rowcount < 1:
+        db.execute("INSERT INTO negocio_datos (clave, valor) VALUES (?, ?)", (clave, valor))
+    _NEG_CACHE["t"] = 0.0
+
+
+@app.route("/api/tienda/estado", methods=["POST"])
+@requiere_login()
+@admin_api
+def api_tienda_estado(db):
+    """Abrir o cerrar los pedidos por la web (lo puede hacer el dueño o un cajero)."""
+    abierta = bool(_json_body().get("abierta"))
+    _guardar_negocio_valor(db, "tienda_abierta", "1" if abierta else "0")
+    return jsonify({"success": True, "tienda_abierta": abierta})
+
+
+def _montos_pago(data, metodo, tasa, campo="monto_usd", nombre="El monto"):
+    """(monto_usd, monto_bs). Si se paga en bolívares y llega monto_bs, queda guardado EXACTO lo que salió de la caja en bolívares."""
+    if not _es_metodo_usd(metodo) and data.get("monto_bs") not in (None, ""):
+        bs = round(_num(data.get("monto_bs"), "El monto en bolívares", 0.01), 2)
+        usd = round(bs / tasa, 2)
+        if usd < 0.01:
+            raise ValueError("El monto es demasiado pequeño.")
+        return usd, bs
+    return _num(data.get(campo), nombre, 0.01), None
+
+
+def _bs_de_pago(r, tasa_hoy):
+    """Bolívares que salieron en un gasto o pago (None si se pagó en dólares)."""
+    if _es_metodo_usd(r["metodo"]):
+        return None
+    if r["monto_bs"] is not None:
+        return round(float(r["monto_bs"]), 2)
+    return round(float(r["monto_usd"]) * (float(r["tasa"] or 0) or tasa_hoy), 2)
+
+
+def _es_metodo_usd(metodo):
+    """Efectivo USD y Zelle salen/entran de la caja en dólares; todo lo demás, de bolívares."""
+    t = str(metodo or "").lower()
+    return any(k in t for k in ("usd", "zelle", "divisa", "dólar", "dolar"))
+
+
+def _caja_saldos(db, sede=None):
+    """UNA sola fórmula para la caja: ventas cobradas − gastos − pagos a proveedores ± ajustes. La usan la pantalla de caja y el balance."""
+    tasa = _cfg_tasa(db)[0]
+    fs = " AND sede_id = ?" if sede else ""
+    ps = (sede,) if sede else ()
+    r = db.execute("SELECT COALESCE(SUM(recibido_usd - vuelto_usd), 0) AS usd, COALESCE(SUM(recibido_bs - vuelto_bs), 0) AS bs "
+                   "FROM ordenes WHERE estado_pago = 'PAGADA'" + fs, ps).fetchone()
+    ing_usd, ing_bs = _f(r["usd"]), _f(r["bs"])
+    egr_usd = egr_bs = 0.0
+    salidas = [dict(x) for x in db.execute("SELECT monto_usd, monto_bs, metodo, tasa FROM gastos WHERE anulado = 0" + fs, ps).fetchall()]
+    fc = " AND c.sede_id = ?" if sede else ""
+    salidas += [dict(x) for x in db.execute(
+        "SELECT pc.monto_usd, pc.monto_bs, pc.metodo, pc.tasa FROM pagos_compra pc JOIN compras c ON c.id = pc.compra_id WHERE c.anulada = 0" + fc, ps).fetchall()]
+    for x in salidas:
+        if _es_metodo_usd(x["metodo"]):
+            egr_usd += _f(x["monto_usd"])
+        elif x["monto_bs"] is not None:
+            egr_bs += _f(x["monto_bs"])
+        else:
+            egr_bs += _f(x["monto_usd"]) * (_f(x["tasa"]) or tasa)
+    aj_usd = aj_bs = 0.0
+    for m in db.execute("SELECT moneda, monto FROM caja_movimientos WHERE 1 = 1" + fs, ps).fetchall():
+        if str(m["moneda"]).upper() == "USD":
+            aj_usd += _f(m["monto"])
+        else:
+            aj_bs += _f(m["monto"])
+    r2 = lambda v: round(v, 2)
+    return {"tasa": tasa,
+            "usd": {"ingresos": r2(ing_usd), "egresos": r2(egr_usd), "ajustes": r2(aj_usd), "saldo": r2(ing_usd - egr_usd + aj_usd)},
+            "bs": {"ingresos": r2(ing_bs), "egresos": r2(egr_bs), "ajustes": r2(aj_bs), "saldo": r2(ing_bs - egr_bs + aj_bs)}}
+
+
+@app.route("/api/caja", methods=["GET"])
+@requiere_login()
+@admin_api
+def api_caja(db):
+    es_super = g.user["rol"] == "superusuario"
+    c = _caja_saldos(db, None if es_super else g.user["sede_id"])  # el dueño ve todas las sedes; el cajero, la suya
+    movs = []
+    if es_super:
+        movs = [{"id": m["id"], "moneda": m["moneda"], "monto": round(_f(m["monto"]), 2), "motivo": m["motivo"] or "", "fecha": m["fecha"]}
+                for m in db.execute("SELECT id, moneda, monto, motivo, fecha FROM caja_movimientos ORDER BY id DESC LIMIT 8").fetchall()]
+    return jsonify({"success": True, "alcance": "todas" if es_super else "sede", **c, "movimientos": movs})
+
+
+@app.route("/api/admin/balance", methods=["GET"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_balance(db):
+    """Lo que TIENES hoy: caja en cada moneda + mercancía a costo + por cobrar − por pagar, todo a la tasa de hoy."""
+    caja = _caja_saldos(db, None)
+    tasa = caja["tasa"]
+    r2 = lambda v: round(v, 2)
+    a_bs = lambda usd: r2(usd * tasa)
+
+    # Inventario a costo (por sede)
+    por_sede = []
+    for r in db.execute(
+            "SELECT s.id AS sede_id, s.nombre AS sede, COALESCE(SUM(i.stock_actual * m.costo_unitario_usd), 0) AS valor, "
+            "COUNT(CASE WHEN i.stock_actual > 0 THEN 1 END) AS articulos "
+            "FROM sedes s LEFT JOIN inventario_por_sede i ON i.sede_id = s.id LEFT JOIN insumos_maestro m ON m.id = i.insumo_id "
+            "GROUP BY s.id, s.nombre ORDER BY s.id").fetchall():
+        por_sede.append({"sede_id": r["sede_id"], "sede": r["sede"], "valor_usd": r2(_f(r["valor"])), "valor_bs": a_bs(_f(r["valor"])), "articulos": int(r["articulos"] or 0)})
+    inv_usd = sum(x["valor_usd"] for x in por_sede)
+
+    # Mercancía estancada: con existencia y sin salir (ni entrar) en los últimos 30 días
+    estancado, nota_est = [], ""
+    primera = db.execute("SELECT MIN(created_at) AS t FROM ordenes").fetchone()["t"]
+    ahora_l = datetime.datetime.now(TZ_LOCAL)
+    pl = a_local(primera)
+    if not pl or (ahora_l - pl).days < 30:
+        nota_est = "Todavía no hay 30 días de historial para detectar mercancía estancada."
+    else:
+        mov = {}
+        for r in db.execute("SELECT insumo_id, tipo, MAX(created_at) AS ultimo FROM movimientos_kardex GROUP BY insumo_id, tipo").fetchall():
+            mov[(r["insumo_id"], r["tipo"])] = a_local(r["ultimo"])
+        limite = ahora_l - datetime.timedelta(days=30)
+        for r in db.execute(
+                "SELECT m.id, m.nombre, m.unidad, m.costo_unitario_usd, COALESCE(SUM(i.stock_actual), 0) AS stock FROM insumos_maestro m "
+                "LEFT JOIN inventario_por_sede i ON i.insumo_id = m.id GROUP BY m.id, m.nombre, m.unidad, m.costo_unitario_usd").fetchall():
+            if _f(r["stock"]) <= 0:
+                continue
+            fechas = [mov.get((r["id"], t)) for t in ("VENTA", "CONSUMO", "MERMA", "COMPRA", "AJUSTE", "TRANSFERENCIA")]
+            fechas = [f for f in fechas if f]
+            if fechas and max(fechas) >= limite:
+                continue
+            valor = _f(r["stock"]) * _f(r["costo_unitario_usd"])
+            estancado.append({"insumo": r["nombre"], "unidad": r["unidad"], "stock": round(_f(r["stock"]), 2), "valor_usd": r2(valor), "valor_bs": a_bs(valor),
+                              "dias": (ahora_l - max(fechas)).days if fechas else None})
+        estancado.sort(key=lambda x: -x["valor_usd"])
+    est_usd = sum(x["valor_usd"] for x in estancado)
+
+    # Cuentas por cobrar (fiados) y por pagar (proveedores): se deben en dólares, en bolívares valen lo de HOY
+    fi = db.execute("SELECT COUNT(*) AS n, COALESCE(SUM(total_venta_usd), 0) AS t FROM ordenes WHERE estado_pago = 'FIADO'").fetchone()
+    por_cobrar = _f(fi["t"])
+    viejos = db.execute("SELECT COUNT(*) AS c FROM ordenes WHERE estado_pago = 'FIADO' AND created_at < ?",
+                        ((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=15)).strftime(FMT_UTC),)).fetchone()
+    pp = db.execute("SELECT COALESCE(SUM(total_usd - pagado_usd), 0) AS t FROM compras WHERE anulada = 0 AND total_usd - pagado_usd > 0.004").fetchone()
+    por_pagar = _f(pp["t"])
+
+    caja_eq_usd = caja["usd"]["saldo"] + caja["bs"]["saldo"] / tasa
+    patrimonio = caja_eq_usd + inv_usd + por_cobrar - por_pagar
+    return jsonify({
+        "success": True, "tasa": tasa,
+        "caja": {"usd": caja["usd"]["saldo"], "bs": caja["bs"]["saldo"], "equivalente_usd": r2(caja_eq_usd), "equivalente_bs": a_bs(caja_eq_usd)},
+        "inventario": {"valor_usd": r2(inv_usd), "valor_bs": a_bs(inv_usd), "por_sede": por_sede,
+                       "estancado": estancado[:10], "estancado_usd": r2(est_usd), "estancado_bs": a_bs(est_usd), "nota_estancado": nota_est},
+        "por_cobrar": {"usd": r2(por_cobrar), "bs": a_bs(por_cobrar), "cuentas": int(fi["n"] if isinstance(fi, dict) else fi[0]),
+                       "vencidas": int(viejos["c"] if isinstance(viejos, dict) else viejos[0])},
+        "por_pagar": {"usd": r2(por_pagar), "bs": a_bs(por_pagar)},
+        "patrimonio": {"usd": r2(patrimonio), "bs": a_bs(patrimonio)},
+    })
+
+
+@app.route("/api/caja/ajuste", methods=["POST"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_caja_ajuste(db):
+    """Retiros, depósitos o correcciones de la caja (también sirve para fijar el saldo inicial)."""
+    data = _json_body()
+    moneda = str(data.get("moneda", "")).upper()
+    if moneda not in ("USD", "BS"):
+        raise ValueError("Elige la moneda.")
+    if data.get("tipo") not in ("ENTRADA", "SALIDA"):
+        raise ValueError("Elige si es una entrada o una salida.")
+    monto = _num(data.get("monto"), "El monto", 0.01)
+    motivo = str(data.get("motivo", "")).strip()[:150]
+    if len(motivo) < 3:
+        raise ValueError("Escribe el motivo del movimiento.")
+    db.execute("INSERT INTO caja_movimientos (sede_id, moneda, monto, motivo, fecha, usuario_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (None, moneda, monto if data["tipo"] == "ENTRADA" else -monto, motivo, _fecha(data.get("fecha")), g.user["id"], ahora_utc_str()))
+    return jsonify({"success": True})
+
+
+def _serializar_turno(t, user_map=None, sede_map=None):
+    ap = a_local(t.get("apertura_at"))
+    ci = a_local(t.get("cierre_at"))
+    return {
+        "id": t["id"],
+        "sede_id": t["sede_id"],
+        "sede_nombre": (sede_map or {}).get(t["sede_id"], f"Sede {t['sede_id']}"),
+        "cajero_id": t["cajero_id"],
+        "cajero_nombre": (user_map or {}).get(t["cajero_id"], "Cajero"),
+        "estado": t["estado"],
+        "apertura_at": ap.strftime("%d/%m %H:%M") if ap else "",
+        "cierre_at": ci.strftime("%d/%m %H:%M") if ci else "",
+        "fondo_inicial_usd": round(float(t.get("fondo_inicial_usd") or 0), 2),
+        "fondo_inicial_bs": round(float(t.get("fondo_inicial_bs") or 0), 2),
+        "efectivo_declarado_cierre_usd": None if t.get("efectivo_declarado_cierre_usd") is None else round(float(t["efectivo_declarado_cierre_usd"]), 2),
+        "efectivo_declarado_cierre_bs": None if t.get("efectivo_declarado_cierre_bs") is None else round(float(t["efectivo_declarado_cierre_bs"]), 2),
+        "diferencia_arqueo_usd": None if t.get("diferencia_arqueo_usd") is None else round(float(t["diferencia_arqueo_usd"]), 2),
+        "diferencia_arqueo_bs": None if t.get("diferencia_arqueo_bs") is None else round(float(t["diferencia_arqueo_bs"]), 2),
+        "notas_cierre": t.get("notas_cierre") or "",
+    }
+
+
+@app.route("/api/turnos/actual", methods=["GET"])
+@requiere_login()
+@admin_api
+def api_turnos_actual(db):
+    user_map = {r["id"]: r["nombre"] for r in db.execute("SELECT id, nombre FROM usuarios").fetchall()}
+    sede_map = {r["id"]: r["nombre"] for r in db.execute("SELECT id, nombre FROM sedes").fetchall()}
+    abierto = db.execute(
+        "SELECT * FROM turnos_caja WHERE cajero_id = ? AND estado = 'ABIERTO' ORDER BY id DESC LIMIT 1",
+        (g.user["id"],),
+    ).fetchone()
+    recientes = []
+    if g.user["rol"] == "superusuario":
+        for r in db.execute("SELECT * FROM turnos_caja ORDER BY id DESC LIMIT 20").fetchall():
+            recientes.append(_serializar_turno(dict(r), user_map, sede_map))
+    else:
+        for r in db.execute("SELECT * FROM turnos_caja WHERE cajero_id = ? ORDER BY id DESC LIMIT 8", (g.user["id"],)).fetchall():
+            recientes.append(_serializar_turno(dict(r), user_map, sede_map))
+    return jsonify({
+        "success": True,
+        "turno_abierto": _serializar_turno(dict(abierto), user_map, sede_map) if abierto else None,
+        "turnos_recientes": recientes,
+    })
+
+
+@app.route("/api/turnos/abrir", methods=["POST"])
+@requiere_login()
+@admin_api
+def api_turnos_abrir(db):
+    data = _json_body()
+    existente = db.execute(
+        "SELECT id FROM turnos_caja WHERE cajero_id = ? AND estado = 'ABIERTO' LIMIT 1",
+        (g.user["id"],),
+    ).fetchone()
+    if existente:
+        raise ValueError(f"Ya tienes el turno #{existente['id']} abierto. Ciérralo antes de abrir uno nuevo.")
+    sede_id = int(g.user["sede_id"] or 0) if g.user["rol"] == "cajero" else _entero(data.get("sede_id"), "La sede")
+    if not sede_id or not db.execute("SELECT id FROM sedes WHERE id = ?", (sede_id,)).fetchone():
+        raise ValueError("Sede no válida.")
+    fondo_usd = _num(data.get("fondo_inicial_usd") or 0, "El fondo inicial en USD", 0)
+    fondo_bs = _num(data.get("fondo_inicial_bs") or 0, "El fondo inicial en Bs", 0)
+    tid = db.insert_returning_id(
+        "INSERT INTO turnos_caja (sede_id, cajero_id, apertura_at, fondo_inicial_usd, fondo_inicial_bs, estado) "
+        "VALUES (?, ?, ?, ?, ?, 'ABIERTO')",
+        (sede_id, g.user["id"], ahora_utc_str(), round(fondo_usd, 2), round(fondo_bs, 2)),
+    )
+    return jsonify({"success": True, "turno_id": tid})
+
+
+@app.route("/api/turnos/cerrar", methods=["POST"])
+@requiere_login()
+@admin_api
+def api_turnos_cerrar(db):
+    """Arqueo ciego: el cajero declara el efectivo contado sin ver el esperado; el servidor calcula la diferencia exacta."""
+    data = _json_body()
+    tid_in = data.get("turno_id")
+    if tid_in and g.user["rol"] == "superusuario":
+        turno = db.execute("SELECT * FROM turnos_caja WHERE id = ? AND estado = 'ABIERTO'", (int(tid_in),)).fetchone()
+    else:
+        turno = db.execute(
+            "SELECT * FROM turnos_caja WHERE cajero_id = ? AND estado = 'ABIERTO' ORDER BY id DESC LIMIT 1",
+            (g.user["id"],),
+        ).fetchone()
+    if not turno:
+        raise ValueError("No tienes ningún turno abierto para cerrar.")
+    turno = dict(turno)
+    decl_usd = _num(data.get("efectivo_declarado_usd") or 0, "El efectivo contado en USD", 0)
+    decl_bs = _num(data.get("efectivo_declarado_bs") or 0, "El efectivo contado en Bs", 0)
+    notas = str(data.get("notas_cierre") or "").strip()[:250]
+
+    agg = db.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(recibido_usd - vuelto_usd), 0) AS net_usd, "
+        "COALESCE(SUM(recibido_bs - vuelto_bs), 0) AS net_bs, COALESCE(SUM(total_venta_usd), 0) AS ventas_usd "
+        "FROM ordenes WHERE turno_id = ? AND estado_pago = 'PAGADA'",
+        (turno["id"],),
+    ).fetchone()
+    n_ord = int(agg["n"] if isinstance(agg, dict) else agg[0])
+    net_usd = float(agg["net_usd"] if isinstance(agg, dict) else agg[1])
+    net_bs = float(agg["net_bs"] if isinstance(agg, dict) else agg[2])
+    ventas_usd = float(agg["ventas_usd"] if isinstance(agg, dict) else agg[3])
+
+    esperado_usd = round(float(turno.get("fondo_inicial_usd") or 0) + net_usd, 2)
+    esperado_bs = round(float(turno.get("fondo_inicial_bs") or 0) + net_bs, 2)
+    dif_usd = round(decl_usd - esperado_usd, 2)
+    dif_bs = round(decl_bs - esperado_bs, 2)
+
+    db.execute(
+        "UPDATE turnos_caja SET cierre_at = ?, efectivo_declarado_cierre_usd = ?, efectivo_declarado_cierre_bs = ?, "
+        "diferencia_arqueo_usd = ?, diferencia_arqueo_bs = ?, notas_cierre = ?, estado = 'CERRADO' WHERE id = ?",
+        (ahora_utc_str(), round(decl_usd, 2), round(decl_bs, 2), dif_usd, dif_bs, notas, turno["id"]),
+    )
+    return jsonify({
+        "success": True,
+        "resumen": {
+            "turno_id": turno["id"],
+            "ordenes_pagadas": n_ord,
+            "ventas_usd": round(ventas_usd, 2),
+            "fondo_inicial_usd": round(float(turno.get("fondo_inicial_usd") or 0), 2),
+            "fondo_inicial_bs": round(float(turno.get("fondo_inicial_bs") or 0), 2),
+            "esperado_usd": esperado_usd,
+            "declarado_usd": round(decl_usd, 2),
+            "diferencia_usd": dif_usd,
+            "esperado_bs": esperado_bs,
+            "declarado_bs": round(decl_bs, 2),
+            "diferencia_bs": dif_bs,
+        },
+    })
+
+
+@app.route("/api/admin/negocio", methods=["GET"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_negocio_get(db):
+    return jsonify({"success": True, "datos": {c: _neg(c) for c in _NEG_CLAVES}})
+
+
+@app.route("/api/admin/negocio", methods=["POST"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_negocio_guardar(db):
+    data = _json_body()
+    limites = {"nombre": 60, "razon_social": 100, "rif": 20, "telefono": 30, "email": 80, "direccion": 200, "maps_url": 300,
+               "horario": 120, "prefijo": 6, "descripcion": 140, "leyenda": 200}
+    limpio = {c: " ".join(str(data.get(c, "")).split())[:lim] for c, lim in limites.items()}
+    if len(limpio["nombre"]) < 2:
+        raise ValueError("Escribe el nombre comercial del negocio.")
+    limpio["rif"] = limpio["rif"].upper()
+    limpio["prefijo"] = re.sub(r"[^A-Z0-9]", "", limpio["prefijo"].upper()) or "FB"
+    if limpio["maps_url"] and not limpio["maps_url"].lower().startswith(("https://", "http://")):
+        raise ValueError("El enlace de Google Maps debe empezar con https://")
+    for c, v in limpio.items():
+        cur = db.execute("UPDATE negocio_datos SET valor = ? WHERE clave = ?", (v, c))
+        if cur.rowcount < 1:
+            db.execute("INSERT INTO negocio_datos (clave, valor) VALUES (?, ?)", (c, v))
+    _NEG_CACHE["t"] = 0.0
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/metodo-pago", methods=["POST"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_metodo_pago(db):
+    """Corrige el método de un pago a proveedor o de un gasto (decide de qué caja sale el dinero)."""
+    data = _json_body()
+    tipo, rid, metodo = data.get("tipo"), _entero(data.get("id"), "El registro"), str(data.get("metodo", ""))
+    if metodo not in METODOS_PAGO:
+        raise ValueError("Elige un método válido.")
+    tabla = {"pago": "pagos_compra", "gasto": "gastos"}.get(tipo)
+    if not tabla:
+        raise ValueError("Tipo no válido.")
+    fila = db.execute(f"SELECT metodo FROM {tabla} WHERE id = ?", (rid,)).fetchone()
+    if not fila:
+        raise ValueError("Registro no encontrado.")
+    db.execute(f"UPDATE {tabla} SET metodo = ? WHERE id = ?", (metodo, rid))
+    log_auditoria(db, "PAGO_PROVEEDOR" if tipo == "pago" else "GASTO", tabla, rid,
+                  {"metodo": fila["metodo"] or ""}, {"metodo": metodo}, f"Cambio de método de pago a {metodo}")
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/diagnostico", methods=["GET"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_diagnostico(db):
+    """Revisión rápida: qué falta configurar o está por corregir para que todo funcione al 100%."""
+    checks = []
+    add = lambda nivel, titulo, detalle="": checks.append({"nivel": nivel, "titulo": titulo, "detalle": detalle})
+
+    # Datos del negocio
+    faltan = [n for n, ok in (("RIF", _neg("rif") not in ("", "J-00000000-0")), ("dirección", bool(_neg("direccion"))),
+                              ("teléfono", bool(_neg("telefono")))) if not ok]
+    if faltan:
+        add("aviso", "Faltan datos de tu empresa", "Completa " + ", ".join(faltan) + " en Admin → Datos del negocio. Salen en la factura.")
+    else:
+        add("ok", "Datos de la empresa completos")
+
+    # Pago móvil que ven los clientes
+    qr = db.execute("SELECT banco, telefono, rif_cedula, qr_base64 FROM metodos_pago_qr WHERE activo = 1 ORDER BY id LIMIT 1").fetchone()
+    if not qr or not str(qr["telefono"] or "").strip() or str(qr["rif_cedula"] or "").strip() in ("", "V-19000000"):
+        add("error", "Datos de Pago Móvil sin configurar", "Los clientes verían datos de ejemplo. Corrígelos en Ajustes → Módulo de Pago Móvil.")
+    elif not str(qr["qr_base64"] or "").strip():
+        add("aviso", "Pago Móvil sin imagen QR", "Opcional: sube el QR de tu banco en Ajustes para que el cliente pague más rápido.")
+    else:
+        add("ok", "Pago Móvil configurado")
+
+    # Google Drive
+    if drive_configurado():
+        add("ok", "Google Drive conectado", "Las fotos de comprobantes y facturas se guardan en tu Drive.")
+    else:
+        add("aviso", "Google Drive sin conectar", "Sin esto no se pueden guardar fotos de comprobantes. Faltan DRIVE_SCRIPT_URL y DRIVE_SCRIPT_TOKEN en Render.")
+
+    # Seguridad
+    if not os.environ.get("SECRET_KEY", "").strip():
+        add("error", "Falta SECRET_KEY en Render", "Sin ella las sesiones se cierran cada vez que el servidor reinicia.")
+    debiles = []
+    for u in db.execute("SELECT nombre, username, pin_hash FROM usuarios WHERE username <> 'pedido_web' AND CAST(activo AS INTEGER) = 1").fetchall():
+        if any(check_password_hash(u["pin_hash"], p) for p in ("1234", "0001", "0002", "123456", "000000")):
+            debiles.append(u["nombre"])
+    if debiles:
+        add("error", "PIN fácil de adivinar", "Cambia el PIN de: " + ", ".join(debiles) + " (Admin → Usuarios).")
+    else:
+        add("ok", "Ningún usuario usa un PIN fácil")
+
+    # Catálogo e inventario
+    sin_receta = [r["nombre"] for r in db.execute(
+        "SELECT p.nombre FROM catalogo_productos p WHERE CAST(p.activo AS INTEGER) = 1 AND NOT EXISTS (SELECT 1 FROM recetas_bom r WHERE r.producto_id = p.id) ORDER BY p.nombre").fetchall()]
+    if sin_receta:
+        add("aviso", f"{len(sin_receta)} producto(s) sin receta", "No descuentan inventario y el menú no limita su cantidad: " + ", ".join(sin_receta[:5]) + ("…" if len(sin_receta) > 5 else ""))
+    else:
+        add("ok", "Todos los productos tienen receta")
+    precio0 = [r["nombre"] for r in db.execute("SELECT nombre FROM catalogo_productos WHERE CAST(activo AS INTEGER) = 1 AND precio_venta_usd <= 0").fetchall()]
+    if precio0:
+        add("error", "Productos con precio en 0", ", ".join(precio0[:5]))
+    agotados = db.execute("SELECT COUNT(*) AS c FROM inventario_por_sede i JOIN sedes s ON s.id = i.sede_id WHERE s.es_almacen = 0 AND i.stock_actual <= 0").fetchone()
+    n_ag = int(agotados["c"] if isinstance(agotados, dict) else agotados[0])
+    if n_ag:
+        add("aviso", f"{n_ag} insumo(s) en cero en alguna sede", "Hay productos que aparecerán agotados en el menú. Repón desde Stock → + Entrada.")
+
+    # Tasa
+    cfg = db.execute("SELECT * FROM configuracion WHERE id = 1").fetchone()
+    if bool(cfg["usar_tasa_manual"]):
+        add("aviso", "Estás usando la tasa manual", f"Bs {float(cfg['tasa_manual']):.2f} por dólar. Recuerda actualizarla cuando cambie.")
+    elif float(cfg["tasa_bcv"] or 0) <= 0:
+        add("error", "Sin tasa del BCV", "Pulsa el botón de refrescar la tasa en la pantalla de caja o usa la tasa manual.")
+    else:
+        add("ok", f"Tasa BCV en uso: Bs {float(cfg['tasa_bcv']):.2f}")
+
+    # Operación
+    add("ok" if _tienda_abierta() else "aviso", "Tienda en línea " + ("abierta" if _tienda_abierta() else "CERRADA"),
+        "Los clientes pueden pedir desde el menú." if _tienda_abierta() else "Los clientes ven el menú pero no pueden pedir. Ábrela cuando estés listo.")
+    viejos = db.execute("SELECT COUNT(*) AS c FROM ordenes WHERE estado_pago = 'FIADO' AND created_at < ?",
+                        ((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=15)).strftime(FMT_UTC),)).fetchone()
+    n_v = int(viejos["c"] if isinstance(viejos, dict) else viejos[0])
+    if n_v:
+        add("aviso", f"{n_v} fiado(s) con más de 15 días sin cobrar", "Revisa Cocina → Cuentas Fiadas y usa «Recordar».")
+    # ---- Cuadre contable: que los números coincidan entre sí ----
+    malos = []
+    n_pag = 0
+    for o in db.execute("SELECT id, total_venta_usd, tasa_aplicada, tasa_cobro, recibido_usd, vuelto_usd, recibido_bs, vuelto_bs FROM ordenes "
+                        "WHERE estado_pago = 'PAGADA' ORDER BY id DESC LIMIT 2000").fetchall():
+        t = _f(o["tasa_cobro"]) or _f(o["tasa_aplicada"]) or 1.0
+        cubierto = _f(o["recibido_usd"]) - _f(o["vuelto_usd"]) + (_f(o["recibido_bs"]) - _f(o["vuelto_bs"])) / t
+        n_pag += 1
+        if abs(cubierto - _f(o["total_venta_usd"])) > 0.06:
+            malos.append(o["id"])
+    if malos:
+        add("aviso", f"{len(malos)} venta(s) no cuadran con el dinero registrado",
+            "El dinero recibido no coincide con el total en las órdenes #" + ", #".join(str(i) for i in malos[:6]) + ("…" if len(malos) > 6 else "") +
+            ". Si fueron fiados cobrados antes de esta versión, corrige la caja con «Ajustar caja».")
+    else:
+        add("ok", f"Las ventas cuadran con el dinero recibido ({n_pag} revisadas)")
+    dif = db.execute("SELECT o.id FROM ordenes o LEFT JOIN orden_items i ON i.orden_id = o.id WHERE o.estado_pago NOT IN ('ANULADA', 'PENDIENTE') GROUP BY o.id, o.total_venta_usd "
+                     "HAVING ABS(o.total_venta_usd - COALESCE(SUM(i.cantidad * i.precio_unitario_usd), 0)) > 0.01 LIMIT 10").fetchall()
+    if dif:
+        add("error", f"{len(dif)} orden(es) con total distinto a la suma de sus productos", "Órdenes #" + ", #".join(str(r["id"]) for r in dif))
+    else:
+        add("ok", "El total de cada orden coincide con sus productos")
+    dc = db.execute("SELECT c.id FROM compras c LEFT JOIN pagos_compra pc ON pc.compra_id = c.id WHERE c.anulada = 0 GROUP BY c.id, c.pagado_usd "
+                    "HAVING ABS(c.pagado_usd - COALESCE(SUM(pc.monto_usd), 0)) > 0.01 LIMIT 10").fetchall()
+    if dc:
+        add("error", f"{len(dc)} compra(s) con pagos que no suman lo pagado", "Compras #" + ", #".join(str(r["id"]) for r in dc))
+    else:
+        add("ok", "Los pagos a proveedores suman lo que dice cada compra")
+    neg = db.execute("SELECT COUNT(*) AS c FROM inventario_por_sede WHERE stock_actual < 0").fetchone()
+    n_neg = int(neg["c"] if isinstance(neg, dict) else neg[0])
+    if n_neg:
+        add("error", f"{n_neg} insumo(s) con inventario negativo", "Corrígelos con «Ajustar» en Stock.")
+    orden = {"error": 0, "aviso": 1, "ok": 2}
+    checks.sort(key=lambda c: orden[c["nivel"]])
+    return jsonify({"success": True, "checks": checks,
+                    "errores": sum(c["nivel"] == "error" for c in checks), "avisos": sum(c["nivel"] == "aviso" for c in checks)})
 
 
 @app.route("/api/admin/categorias-gasto", methods=["POST"])
@@ -2219,15 +2998,19 @@ def api_admin_finanzas_resumen(db):
     fs = " AND sede_id = ?" if sede else ""
     ps = (sede,) if sede else ()
 
-    ventas = db.execute("SELECT sede_id, total_venta_usd, costo_insumos_usd, estado_pago, created_at, cobrado_at FROM ordenes "
+    tasa_hoy = _cfg_tasa(db)[0]
+    ventas = db.execute("SELECT sede_id, total_venta_usd, costo_insumos_usd, tasa_aplicada, tasa_reposicion_momento, estado_pago, created_at, cobrado_at, recibido_usd, vuelto_usd, recibido_bs, vuelto_bs FROM ordenes "
                         "WHERE created_at >= ? AND created_at < ?" + fs, (u0, u1) + ps).fetchall()
-    cobros = db.execute("SELECT total_venta_usd, cobrado_at FROM ordenes WHERE cobrado_at IS NOT NULL AND cobrado_at >= ? AND cobrado_at < ?" + fs,
+    mermas_rows = db.execute("SELECT COALESCE(SUM(ABS(cantidad) * costo_unitario_momento), 0) AS total FROM movimientos_kardex "
+                             "WHERE tipo IN ('MERMA', 'CONSUMO') AND created_at >= ? AND created_at < ?" + fs, (u0, u1) + ps).fetchone()
+    mermas_usd = float(mermas_rows["total"] if isinstance(mermas_rows, dict) else mermas_rows[0])
+    cobros = db.execute("SELECT total_venta_usd, cobrado_at, recibido_usd, vuelto_usd, recibido_bs, vuelto_bs FROM ordenes WHERE estado_pago = 'PAGADA' AND cobrado_at IS NOT NULL AND cobrado_at >= ? AND cobrado_at < ?" + fs,
                         (u0, u1) + ps).fetchall()
     pendientes = db.execute("SELECT cliente_nombre, total_venta_usd FROM ordenes WHERE estado_pago = 'FIADO'" + fs, ps).fetchall()
-    gastos = db.execute("SELECT categoria, monto_usd, fecha FROM gastos WHERE anulado = 0 AND fecha >= ? AND fecha <= ?" + fs,
+    gastos = db.execute("SELECT categoria, monto_usd, monto_bs, metodo, tasa, fecha FROM gastos WHERE anulado = 0 AND fecha >= ? AND fecha <= ?" + fs,
                         (desde, hasta) + ps).fetchall()
     fc = " AND c.sede_id = ?" if sede else ""
-    pagos = db.execute("SELECT pc.monto_usd, pc.fecha FROM pagos_compra pc JOIN compras c ON c.id = pc.compra_id "
+    pagos = db.execute("SELECT pc.monto_usd, pc.monto_bs, pc.metodo, pc.tasa, pc.fecha FROM pagos_compra pc JOIN compras c ON c.id = pc.compra_id "
                        "WHERE c.anulada = 0 AND pc.fecha >= ? AND pc.fecha <= ?" + fc, (desde, hasta) + ps).fetchall()
     deudas = db.execute("SELECT c.total_usd, c.pagado_usd, pr.nombre AS proveedor FROM compras c LEFT JOIN proveedores pr ON pr.id = c.proveedor_id "
                         "WHERE c.anulada = 0 AND c.total_usd - c.pagado_usd > 0.004" + fc, ps).fetchall()
@@ -2237,35 +3020,56 @@ def api_admin_finanzas_resumen(db):
         dias[d.isoformat()] = {"fecha": d.isoformat(), "ingresos": 0.0, "egresos": 0.0}
         d += datetime.timedelta(days=1)
 
-    ventas_total = costo_total = ingreso_ventas = ingreso_cobros = 0.0
+    ventas_total = costo_total = ingreso_ventas = ingreso_cobros = brecha_cambiaria_usd = 0.0
+    in_usd = in_bs = out_usd = out_bs = 0.0  # dinero REAL que entró y salió en cada moneda
     for o in ventas:
-        if o["estado_pago"] == "ANULADA":
+        if o["estado_pago"] in ("ANULADA", "PENDIENTE"):
             continue
         t = float(o["total_venta_usd"])
         ventas_total += t
         costo_total += float(o["costo_insumos_usd"])
+        if o["estado_pago"] == "PAGADA":
+            bs_neto = max(0.0, float(o["recibido_bs"] or 0) - float(o["vuelto_bs"] or 0))
+            ta = float(o["tasa_aplicada"] or 0)
+            tr = float(o["tasa_reposicion_momento"] or 0)
+            if bs_neto > 0 and ta > 0 and tr > ta:
+                brecha_cambiaria_usd += (bs_neto / ta) - (bs_neto / tr)
         if o["estado_pago"] == "PAGADA" and not o["cobrado_at"]:
             loc = a_local(o["created_at"])
             if loc and loc.date().isoformat() in dias:
                 dias[loc.date().isoformat()]["ingresos"] += t
                 ingreso_ventas += t
+                in_usd += float(o["recibido_usd"] or 0) - float(o["vuelto_usd"] or 0)
+                in_bs += float(o["recibido_bs"] or 0) - float(o["vuelto_bs"] or 0)
     for c in cobros:
         loc, t = a_local(c["cobrado_at"]), float(c["total_venta_usd"])
         if loc and loc.date().isoformat() in dias:
             dias[loc.date().isoformat()]["ingresos"] += t
             ingreso_cobros += t
+            in_usd += float(c["recibido_usd"] or 0) - float(c["vuelto_usd"] or 0)
+            in_bs += float(c["recibido_bs"] or 0) - float(c["vuelto_bs"] or 0)
 
-    por_categoria, egreso_gastos, egreso_prov = {}, 0.0, 0.0
+    por_categoria, egreso_gastos, gastos_operativos, egreso_prov = {}, 0.0, 0.0, 0.0
     for r in gastos:
         m = float(r["monto_usd"])
         egreso_gastos += m
+        if str(r["categoria"] or "").strip().lower() != "compra de inventario":
+            gastos_operativos += m
         por_categoria[r["categoria"]] = por_categoria.get(r["categoria"], 0.0) + m
+        if _es_metodo_usd(r["metodo"]):
+            out_usd += m
+        else:
+            out_bs += _bs_de_pago(r, tasa_hoy)
         f = str(r["fecha"])[:10]
         if f in dias:
             dias[f]["egresos"] += m
     for r in pagos:
         m = float(r["monto_usd"])
         egreso_prov += m
+        if _es_metodo_usd(r["metodo"]):
+            out_usd += m
+        else:
+            out_bs += _bs_de_pago(r, tasa_hoy)
         f = str(r["fecha"])[:10]
         if f in dias:
             dias[f]["egresos"] += m
@@ -2287,18 +3091,89 @@ def api_admin_finanzas_resumen(db):
     egresos = egreso_gastos + egreso_prov
     ordenar = lambda dic: [{"nombre": k, "monto_usd": round(v, 2)} for k, v in sorted(dic.items(), key=lambda kv: -kv[1])]
     return jsonify({
-        "success": True, "desde": desde, "hasta": hasta,
+        "success": True, "desde": desde, "hasta": hasta, "tasa": tasa_hoy,
+        "por_moneda": {"usd": {"entro": round(in_usd, 2), "salio": round(out_usd, 2), "neto": round(in_usd - out_usd, 2)},
+                       "bs": {"entro": round(in_bs, 2), "salio": round(out_bs, 2), "neto": round(in_bs - out_bs, 2)}},
         "ventas_total_usd": round(ventas_total, 2), "costo_insumos_usd": round(costo_total, 2),
         "utilidad_bruta_usd": round(ventas_total - costo_total, 2),
         "ingresos_ventas_usd": round(ingreso_ventas, 2), "ingresos_cobros_fiado_usd": round(ingreso_cobros, 2),
         "ingresos_usd": round(ingresos, 2),
-        "gastos_usd": round(egreso_gastos, 2), "pagos_proveedores_usd": round(egreso_prov, 2), "egresos_usd": round(egresos, 2),
+        "gastos_usd": round(egreso_gastos, 2), "gastos_operativos_usd": round(gastos_operativos, 2),
+        "mermas_usd": round(mermas_usd, 2), "brecha_cambiaria_usd": round(brecha_cambiaria_usd, 2),
+        "pagos_proveedores_usd": round(egreso_prov, 2), "egresos_usd": round(egresos, 2),
         "flujo_neto_usd": round(ingresos - egresos, 2),
-        "utilidad_operativa_usd": round(ventas_total - costo_total - egreso_gastos, 2),
+        "utilidad_operativa_usd": round(ventas_total - costo_total - gastos_operativos - mermas_usd - brecha_cambiaria_usd, 2),
         "por_cobrar_usd": round(por_cobrar, 2), "por_pagar_usd": round(por_pagar, 2),
         "serie": [{"fecha": v["fecha"], "ingresos": round(v["ingresos"], 2), "egresos": round(v["egresos"], 2)} for v in dias.values()],
         "gastos_por_categoria": ordenar(por_categoria), "deudas_por_proveedor": ordenar(deuda_prov), "fiados_por_cliente": ordenar(fiado_cli),
     })
+
+
+@app.route("/api/admin/reiniciar-operacion", methods=["POST"])
+@requiere_login(roles=("superusuario",))
+@admin_api
+def api_admin_reiniciar_operacion(db):
+    """Reinicia operaciones, ventas, finanzas, caja y (opcionalmente) stock para comenzar de cero con capital sincerado."""
+    data = _json_body()
+    confirmacion = str(data.get("confirmacion", "")).strip().upper()
+    if confirmacion != "REINICIAR":
+        raise ValueError("Debes escribir exactamente la palabra REINICIAR para confirmar.")
+    pin = str(data.get("pin", "")).strip()
+    u_row = db.execute("SELECT pin_hash FROM usuarios WHERE id = ?", (g.user["id"],)).fetchone()
+    if not u_row or not check_password_hash(u_row["pin_hash"], pin):
+        raise ValueError("El PIN de superusuario no es correcto.")
+
+    reiniciar_inventario = bool(data.get("reiniciar_inventario", True))
+    capital_usd = _num(data.get("capital_inicial_usd") or 0, "El capital inicial en USD", 0)
+    capital_bs = _num(data.get("capital_inicial_bs") or 0, "El capital inicial en Bs", 0)
+    justificacion = str(data.get("justificacion") or "").strip()[:200] or "Sinceración de capital e inventario para comenzar de cero"
+
+    with _LOCK_RESERVA:
+        for tabla in (
+            "orden_items",
+            "ordenes",
+            "movimientos_kardex",
+            "turnos_caja",
+            "caja_movimientos",
+            "gastos",
+            "pagos_compra",
+            "compras",
+            "archivos",
+            "auditoria_logs",
+        ):
+            db.execute(f"DELETE FROM {tabla}")
+
+        if reiniciar_inventario:
+            db.execute("UPDATE inventario_por_sede SET stock_actual = 0")
+
+        ahora = ahora_utc_str()
+        hoy = hoy_local().isoformat()
+        if capital_usd > 0:
+            db.execute(
+                "INSERT INTO caja_movimientos (sede_id, moneda, monto, motivo, fecha, usuario_id, created_at) VALUES (?, 'USD', ?, ?, ?, ?, ?)",
+                (None, round(capital_usd, 2), "Capital inicial tras reinicio operativo", hoy, g.user["id"], ahora),
+            )
+        if capital_bs > 0:
+            db.execute(
+                "INSERT INTO caja_movimientos (sede_id, moneda, monto, motivo, fecha, usuario_id, created_at) VALUES (?, 'BS', ?, ?, ?, ?, ?)",
+                (None, round(capital_bs, 2), "Capital inicial tras reinicio operativo", hoy, g.user["id"], ahora),
+            )
+
+        log_auditoria(
+            db,
+            "REINICIO_SISTEMA",
+            "sistema",
+            0,
+            None,
+            {
+                "reiniciar_inventario": reiniciar_inventario,
+                "capital_inicial_usd": round(capital_usd, 2),
+                "capital_inicial_bs": round(capital_bs, 2),
+            },
+            justificacion,
+        )
+
+    return jsonify({"success": True})
 
 
 # ----------------------------------------------------------------------
@@ -2352,7 +3227,7 @@ def api_orden_factura_link(db, oid):
     datos = _datos_factura(db, oid)
     url = request.url_root.rstrip("/") + "/factura/" + _firmador_factura.dumps({"o": oid})
     nombre = (datos["cliente"] or "").strip()
-    texto = (f"Hola {nombre}" if nombre else "Hola") + f", gracias por tu compra en {NEGOCIO_NOMBRE}. 🍔\n"
+    texto = (f"Hola {nombre}" if nombre else "Hola") + f", gracias por tu compra en {_nn()}. 🍔\n"
     texto += f"Tu factura {datos['numero']} por {datos['total']}"
     texto += " (pendiente de pago)" if datos["fiado"] else ""
     texto += f" está aquí:\n{url}"
@@ -2477,7 +3352,7 @@ def _disponibilidad(db, sede_id):
 
 def _cerrar_pedido_web(db, oid, nuevo_estado, motivo, usuario_id):
     """Libera la mercancía apartada. Idempotente: solo actúa si el pedido sigue activo (no repone dos veces)."""
-    cur = db.execute("UPDATE ordenes SET estado_web = ?, vencimiento = NULL WHERE id = ? AND estado_web IN ('PENDIENTE_PAGO', 'PAGO_REPORTADO')",
+    cur = db.execute("UPDATE ordenes SET estado_web = ?, estado_pago = 'ANULADA', vencimiento = NULL WHERE id = ? AND estado_web IN ('PENDIENTE_PAGO', 'PAGO_REPORTADO')",
                      (nuevo_estado, oid))
     if cur.rowcount < 1:
         return False
@@ -2517,7 +3392,10 @@ def _segundos_restantes(venc):
 
 
 def _ip_cliente():
-    return (request.headers.get("X-Forwarded-For", request.remote_addr or "") or "").split(",")[0].strip() or "?"
+    if os.environ.get("RENDER") or os.environ.get("TRUST_PROXY"):
+        return (request.remote_addr or "").strip() or "?"
+    xff = (request.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+    return (request.remote_addr or xff or "").strip() or "?"
 
 
 def _marcas_ip(ip, clave, ventana=3600):
@@ -2556,11 +3434,11 @@ def _estado_publico(db, oid):
     items = [{"nombre": r["nombre"] or "Producto", "cantidad": int(r["cantidad"]),
               "total_bs": round(round(float(r["precio_unitario_usd"]) * tasa, 2) * int(r["cantidad"]), 2)} for r in filas]
     estado = o.get("estado_web") or ""
-    res = {"id": oid, "estado": estado, "sede": o.get("sede_nombre") or "", "cliente": o.get("cliente_nombre") or "",
+    res = {"id": oid, "estado": estado, "estado_cocina": o.get("estado_cocina") or "PREPARANDO", "sede": o.get("sede_nombre") or "", "cliente": o.get("cliente_nombre") or "",
            "items": items, "total_bs": round(float(o["total_venta_usd"]) * tasa, 2),
            "segundos_restantes": _segundos_restantes(o.get("vencimiento")) if estado == "PENDIENTE_PAGO" else 0,
            "vence_min": PEDIDO_VENCE_MIN, "referencia": o.get("referencia_pago") or "", "pago_metodo": o.get("pago_metodo") or "",
-           "contacto": NEGOCIO_TEL or ""}
+           "contacto": _ntel() or ""}
     if estado == "PENDIENTE_PAGO":
         qr = db.execute("SELECT titulo, banco, telefono, rif_cedula, qr_base64 FROM metodos_pago_qr WHERE activo = 1 ORDER BY id LIMIT 1").fetchone()
         res["pago"] = dict(qr) if qr else None
@@ -2576,7 +3454,8 @@ def api_publico_menu(db):
     liberar_vencidos(db)
     sedes = _sedes_publicas(db)
     if not sedes:
-        return jsonify({"success": True, "negocio": NEGOCIO_NOMBRE, "vence_min": PEDIDO_VENCE_MIN, "sedes": [], "sede_id": None, "productos": []})
+        return jsonify({"success": True, "negocio": _nn(), "vence_min": PEDIDO_VENCE_MIN, "sedes": [], "sede_id": None, "productos": [], "abierta": _tienda_abierta(),
+                        "direccion": _neg("direccion"), "maps_url": _neg("maps_url"), "horario": _neg("horario")})
     sid = request.args.get("sede_id", type=int)
     if sid not in [x["id"] for x in sedes]:
         sid = sedes[0]["id"]
@@ -2588,8 +3467,9 @@ def api_publico_menu(db):
         usd = float(p["precio_venta_usd"])
         productos.append({"id": p["id"], "nombre": p["nombre"], "tipo": p["tipo"], "precio_usd": round(usd, 2),
                           "precio_bs": round(usd * tasa, 2), "disponible": None if d is None else min(d, 99)})
-    return jsonify({"success": True, "negocio": NEGOCIO_NOMBRE, "vence_min": PEDIDO_VENCE_MIN,
-                    "sedes": sedes, "sede_id": sid, "productos": productos})
+    return jsonify({"success": True, "negocio": _nn(), "vence_min": PEDIDO_VENCE_MIN,
+                    "sedes": sedes, "sede_id": sid, "productos": productos, "abierta": _tienda_abierta(),
+                    "direccion": _neg("direccion"), "maps_url": _neg("maps_url"), "horario": _neg("horario")})
 
 
 @app.route("/api/publico/pedido", methods=["POST"])
@@ -2602,6 +3482,8 @@ def api_publico_pedido_crear(db):
     _anotar_ip(ip, "intentos")
     if _limite_ip_superado(ip, "intentos", 60) or _limite_ip_superado(ip, "creados", 6):
         return jsonify({"success": False, "error": "Hiciste demasiados pedidos seguidos. Intenta de nuevo en un rato."}), 429
+    if not _tienda_abierta():
+        raise ValueError("Estamos cerrados por ahora y no recibimos pedidos. ¡Vuelve pronto!")
     nombre = str(data.get("nombre", "")).strip()[:60]
     if len(nombre) < 2:
         raise ValueError("Escribe tu nombre.")
@@ -2662,7 +3544,7 @@ def api_publico_pedido_crear(db):
                 recibido_usd, recibido_bs, vuelto_usd, vuelto_bs,
                 estado_pago, estado_cocina, notas_cocina, referencia_pago, created_at,
                 origen, estado_web, vencimiento, ip_creacion
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'ANULADA', 'PREPARANDO', ?, '', ?, 'WEB', 'PENDIENTE_PAGO', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'PENDIENTE', 'PREPARANDO', ?, '', ?, 'WEB', 'PENDIENTE_PAGO', ?, ?)
         """, (sede_id, web_id, nombre, tel, total_usd, costo_total, tasa, tasa_rep, notas, ahora, vence, _ip_cliente()))
         for pid, cant, precio, costo_unit in lineas:
             db.execute("INSERT INTO orden_items (orden_id, producto_id, cantidad, precio_unitario_usd, costo_unitario_usd, modificadores_json) "
@@ -2771,13 +3653,16 @@ def api_pedidos_web(db):
             items.setdefault(r["orden_id"], []).append({"nombre": r["nombre"] or "Producto", "cantidad": int(r["cantidad"])})
         for r in db.execute(f"SELECT id, entidad_id FROM archivos WHERE entidad = 'orden' AND entidad_id IN ({marca}) ORDER BY id", tuple(ids)).fetchall():
             archivos.setdefault(r["entidad_id"], []).append(r["id"])
+    refs_rep = list({f["referencia_pago"] for f in filas if f.get("referencia_pago") and f["estado_web"] == "PAGO_REPORTADO"})
+    conteo_refs = {}
+    if refs_rep:
+        m_refs = ",".join("?" for _ in refs_rep)
+        for r in db.execute(f"SELECT referencia_pago, COUNT(*) AS c FROM ordenes WHERE referencia_pago IN ({m_refs}) GROUP BY referencia_pago", tuple(refs_rep)).fetchall():
+            conteo_refs[r["referencia_pago"]] = int(r["c"] if isinstance(r, dict) else r[1])
     pedidos = []
     for f in filas:
         tasa = float(f["tasa_aplicada"] or 0)
-        dup = 0
-        if f.get("referencia_pago") and f["estado_web"] == "PAGO_REPORTADO":
-            d = db.execute("SELECT COUNT(*) AS c FROM ordenes WHERE referencia_pago = ? AND id <> ?", (f["referencia_pago"], f["id"])).fetchone()
-            dup = int(d["c"] if isinstance(d, dict) else d[0])
+        dup = max(0, conteo_refs.get(f.get("referencia_pago"), 0) - 1) if (f.get("referencia_pago") and f["estado_web"] == "PAGO_REPORTADO") else 0
         creado = a_local(f.get("created_at"))
         rep_at = a_local(f.get("pago_reportado_at"))
         pedidos.append({
@@ -2790,7 +3675,7 @@ def api_pedidos_web(db):
             "monto_reportado_bs": float(f["pago_monto_bs"] or 0), "referencia_repetida": dup > 0,
             "creado": creado.strftime("%H:%M") if creado else "", "reportado": rep_at.strftime("%H:%M") if rep_at else "",
         })
-    return jsonify({"success": True, "pedidos": pedidos})
+    return jsonify({"success": True, "pedidos": pedidos, "tienda_abierta": _tienda_abierta()})
 
 
 @app.route("/api/pedidos-web/<int:oid>/confirmar", methods=["POST"])
@@ -2803,7 +3688,12 @@ def api_pedido_web_confirmar(db, oid):
         raise ValueError("Este pedido ya no está pendiente (venció o ya fue atendido).")
     metodo = (o.get("pago_metodo") or str(_json_body().get("metodo") or "Pago móvil"))[:40]
     total_usd, tasa = float(o["total_venta_usd"]), float(o["tasa_aplicada"])
-    rec_usd, rec_bs = (total_usd, 0.0) if metodo == "Zelle" else (0.0, round(total_usd * tasa, 2))
+    monto_rep_bs = float(o.get("pago_monto_bs") or 0)
+    if _es_metodo_usd(metodo):
+        rec_usd, rec_bs = total_usd, 0.0
+    else:
+        rec_usd = 0.0
+        rec_bs = round(monto_rep_bs, 2) if monto_rep_bs > 0 else round(total_usd * tasa, 2)
     cur = db.execute(
         "UPDATE ordenes SET estado_pago = 'PAGADA', estado_web = 'CONFIRMADA', estado_cocina = 'PREPARANDO', cobrado_at = ?, metodo_cobro = ?, "
         "recibido_usd = ?, recibido_bs = ?, vencimiento = NULL WHERE id = ? AND estado_web IN ('PENDIENTE_PAGO', 'PAGO_REPORTADO')",
@@ -3119,6 +4009,8 @@ function generarOrdenesHistoricas() { return []; }
 // ==========================================================
 const fmtUSD = (n) => (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 // Fecha "de hoy" en hora de Venezuela (UTC-4), no en UTC: así las ventas de la noche cuentan para el día correcto.
+const metodoEsUSD = (m) => /usd|zelle|divisa|d[oó]lar/i.test(String(m || ''));
+
 const hoyCaracas = (offsetDias = 0) => new Date(Date.now() - 4 * 3600000 - offsetDias * 86400000).toISOString().split('T')[0];
 const inicioMesCaracas = () => hoyCaracas().slice(0, 8) + '01';
 
@@ -3254,17 +4146,18 @@ function Campo({ label, children }) {
   );
 }
 
-function Kpi({ titulo, valor, tono = 'text-white', nota }) {
+function Kpi({ titulo, valor, tono = 'text-white', nota, tasa }) {
   return (
     <div className="bg-[#111114] border border-[#222227] rounded-2xl p-3">
       <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">{titulo}</div>
       <div className={`text-lg font-black font-mono mt-1 ${tono}`}>${fmtUSD(valor)}</div>
+      {tasa > 0 && <div className="text-[11px] font-mono text-zinc-400">Bs {fmtUSD(valor * tasa)}</div>}
       {nota && <div className="text-[10px] text-zinc-500 mt-0.5">{nota}</div>}
     </div>
   );
 }
 
-function ListaBarras({ filas, color = 'bg-[#2563eb]', vacio }) {
+function ListaBarras({ filas, color = 'bg-[#2563eb]', vacio, tasa }) {
   const max = Math.max(1, ...filas.map(f => f.monto_usd));
   if (!filas.length) return <div className="text-xs text-zinc-500 py-2">{vacio}</div>;
   return (
@@ -3273,7 +4166,7 @@ function ListaBarras({ filas, color = 'bg-[#2563eb]', vacio }) {
         <div key={f.nombre}>
           <div className="flex justify-between text-xs">
             <span className="text-zinc-200 truncate pr-2">{f.nombre}</span>
-            <span className="font-mono font-bold text-white">${fmtUSD(f.monto_usd)}</span>
+            <span className="font-mono font-bold text-white">${fmtUSD(f.monto_usd)}{tasa > 0 && <span className="text-[10px] text-zinc-400 font-normal"> · Bs {fmtUSD(f.monto_usd * tasa)}</span>}</span>
           </div>
           <div className="h-1.5 bg-[#09090b] rounded-full mt-1 overflow-hidden">
             <div className={`h-full ${color} rounded-full`} style={{ width: `${(f.monto_usd / max) * 100}%` }} />
@@ -3299,6 +4192,7 @@ function AdminPanel({ sedes, insumos, usuarioActual, onCambio }) {
     ['gastos', 'Gastos'],
     ['deudas', 'Proveedores y deudas'],
     ['productos', 'Productos y precios'],
+    ['negocio', 'Datos del negocio'],
     ['usuarios', 'Usuarios y sedes']
   ];
 
@@ -3321,16 +4215,95 @@ function AdminPanel({ sedes, insumos, usuarioActual, onCambio }) {
           </button>
         ))}
       </div>
-      {tab === 'resumen' && <FinanzasResumen sedes={sedes} />}
+      {tab === 'resumen' && (<><BalanceCard /><FinanzasResumen sedes={sedes} /></>)}
       {tab === 'gastos' && <GastosTab sedes={sedes} avisar={avisar} />}
       {tab === 'deudas' && <DeudasTab sedes={sedes} avisar={avisar} />}
       {tab === 'productos' && <ProductosTab insumos={insumos} avisar={avisar} onCambio={onCambio} />}
+      {tab === 'negocio' && <NegocioTab avisar={avisar} />}
       {tab === 'usuarios' && <UsuariosTab usuarioActual={usuarioActual} avisar={avisar} onCambio={onCambio} />}
     </div>
   );
 }
 
 // ---------------------------------------------------------- FLUJO DE CAJA
+function BalanceCard() {
+  const [b, setB] = useState(null);
+  const [error, setError] = useState('');
+  const cargar = async () => {
+    const r = await apiAdmin('/api/admin/balance');
+    if (r.success) { setB(r); setError(''); } else setError(r.error || 'No se pudo calcular el balance.');
+  };
+  useEffect(() => { cargar(); const t = setInterval(cargar, 60000); return () => clearInterval(t); }, []);
+  if (error) return <div className="bg-red-950/50 border border-red-900 text-red-300 text-xs rounded-xl p-3">{error}</div>;
+  if (!b) return <div className="text-xs text-zinc-500 py-4 text-center">Calculando lo que tienes hoy…</div>;
+  const fila = (icono, titulo, usd, bs, tono = 'text-white', sub) => (
+    <div className="flex items-start justify-between gap-3 py-2 border-b border-[#222227] last:border-0">
+      <div className="min-w-0">
+        <div className="text-xs font-bold text-zinc-200">{icono} {titulo}</div>
+        {sub && <div className="text-[10px] text-zinc-500">{sub}</div>}
+      </div>
+      <div className="text-right shrink-0">
+        <div className={`font-mono font-black text-sm ${tono}`}>{usd < 0 ? '−' : ''}${fmtUSD(Math.abs(usd))}</div>
+        <div className="font-mono text-[11px] text-zinc-400">{bs < 0 ? '−' : ''}Bs {fmtUSD(Math.abs(bs))}</div>
+      </div>
+    </div>
+  );
+  return (
+    <div className={cardCls}>
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-xs font-bold text-white uppercase">📊 Lo que tienes hoy</h3>
+        <span className="text-[10px] text-zinc-500 font-mono">Tasa de hoy: Bs {fmtUSD(b.tasa)}</span>
+      </div>
+      <div className="rounded-xl bg-[#09090b] border border-emerald-900/60 p-3 text-center">
+        <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Patrimonio neto</div>
+        <div className={`text-2xl font-black font-mono ${b.patrimonio.usd >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>${fmtUSD(b.patrimonio.usd)}</div>
+        <div className="text-xs font-mono text-zinc-400">Bs {fmtUSD(b.patrimonio.bs)}</div>
+        <div className="text-[10px] text-zinc-500 mt-1">Caja + mercancía + lo que te deben − lo que debes</div>
+      </div>
+      <div>
+        <div className="flex items-start justify-between gap-3 py-2 border-b border-[#222227]">
+          <div className="text-xs font-bold text-zinc-200">💵 Caja en dólares</div>
+          <div className="font-mono font-black text-sm text-white">${fmtUSD(b.caja.usd)}</div>
+        </div>
+        <div className="flex items-start justify-between gap-3 py-2 border-b border-[#222227]">
+          <div className="text-xs font-bold text-zinc-200">🇻🇪 Caja en bolívares</div>
+          <div className="font-mono font-black text-sm text-white">Bs {fmtUSD(b.caja.bs)}</div>
+        </div>
+        {fila('🏦', 'Caja total (equivalente)', b.caja.equivalente_usd, b.caja.equivalente_bs, 'text-white', 'Dólares + bolívares convertidos a la tasa de hoy')}
+        {fila('📦', 'Mercancía en inventario (a costo)', b.inventario.valor_usd, b.inventario.valor_bs, 'text-white', 'Lo que invertiste y sigue en stock')}
+        {fila('🧾', 'Nos deben (fiados)', b.por_cobrar.usd, b.por_cobrar.bs, 'text-amber-400', `${b.por_cobrar.cuentas} cuenta(s)${b.por_cobrar.vencidas ? ` · ${b.por_cobrar.vencidas} con más de 15 días` : ''} · en bolívares valen lo de hoy`)}
+        {fila('🏪', 'Debemos a proveedores', -b.por_pagar.usd, -b.por_pagar.bs, 'text-red-400', 'En bolívares vale lo de hoy')}
+      </div>
+      <details className="text-xs">
+        <summary className="cursor-pointer text-zinc-400 font-bold">Mercancía por sede{b.inventario.estancado.length ? ` · ⚠️ ${b.inventario.estancado.length} estancada(s)` : ''}</summary>
+        <div className="mt-2 space-y-1">
+          {b.inventario.por_sede.map(x => (
+            <div key={x.sede_id} className="flex justify-between text-[11px]">
+              <span className="text-zinc-300">{x.sede} <span className="text-zinc-500">({x.articulos} artículos)</span></span>
+              <span className="font-mono text-zinc-200">${fmtUSD(x.valor_usd)} · Bs {fmtUSD(x.valor_bs)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 text-[11px] font-bold text-amber-300">Mercancía estancada (sin moverse en 30 días)</div>
+        {b.inventario.nota_estancado && <div className="text-[10px] text-zinc-500">{b.inventario.nota_estancado}</div>}
+        {!b.inventario.nota_estancado && b.inventario.estancado.length === 0 && <div className="text-[10px] text-emerald-400">Ninguna: todo lo que tienes se está moviendo. ✅</div>}
+        {b.inventario.estancado.length > 0 && (
+          <div className="mt-1 space-y-1">
+            {b.inventario.estancado.map((x, i) => (
+              <div key={i} className="flex justify-between text-[11px]">
+                <span className="text-zinc-300">{x.insumo} <span className="text-zinc-500">· {x.stock} {x.unidad}{x.dias !== null ? ` · ${x.dias} días` : ''}</span></span>
+                <span className="font-mono text-amber-300">${fmtUSD(x.valor_usd)}</span>
+              </div>
+            ))}
+            <div className="text-[10px] text-zinc-500">Dinero parado en estas existencias: ${fmtUSD(b.inventario.estancado_usd)} · Bs {fmtUSD(b.inventario.estancado_bs)}</div>
+          </div>
+        )}
+      </details>
+      <p className="text-[10px] text-zinc-500">Todo sale de los mismos registros de ventas, gastos, pagos e inventario: si agregas o quitas algo en cualquier pantalla, aquí cambia solo.</p>
+    </div>
+  );
+}
+
 function FinanzasResumen({ sedes }) {
   const [preset, setPreset] = useState('hoy');
   const [desde, setDesde] = useState(hoyCaracas());
@@ -3389,13 +4362,31 @@ function FinanzasResumen({ sedes }) {
             <Kpi titulo="Entró a caja" valor={d.ingresos_usd} tono="text-emerald-400" nota={`Ventas ${fmtUSD(d.ingresos_ventas_usd)} + fiados cobrados ${fmtUSD(d.ingresos_cobros_fiado_usd)}`} />
             <Kpi titulo="Salió de caja" valor={d.egresos_usd} tono="text-red-400" nota={`Gastos ${fmtUSD(d.gastos_usd)} + proveedores ${fmtUSD(d.pagos_proveedores_usd)}`} />
             <Kpi titulo="Flujo neto" valor={d.flujo_neto_usd} tono={d.flujo_neto_usd >= 0 ? 'text-emerald-400' : 'text-red-400'} />
-            <Kpi titulo="Utilidad operativa" valor={d.utilidad_operativa_usd} tono={d.utilidad_operativa_usd >= 0 ? 'text-white' : 'text-red-400'} nota="Ventas − costo de insumos − gastos" />
+            <Kpi titulo="Utilidad operativa real" valor={d.utilidad_operativa_usd} tono={d.utilidad_operativa_usd >= 0 ? 'text-white' : 'text-red-400'} nota={`Descuenta BOM, gastos op., mermas (${fmtUSD(d.mermas_usd || 0)}) y brecha (${fmtUSD(d.brecha_cambiaria_usd || 0)})`} />
+          </div>
+          <div className={cardCls}>
+            <h3 className="text-xs font-bold text-white uppercase">Dinero real por moneda en este período</h3>
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="rounded-xl bg-[#09090b] border border-[#222227] p-3 space-y-0.5">
+                <div className="font-bold text-zinc-200">💵 Dólares</div>
+                <div className="font-mono text-emerald-400">Entró +${fmtUSD(d.por_moneda.usd.entro)}</div>
+                <div className="font-mono text-red-400">Salió −${fmtUSD(d.por_moneda.usd.salio)}</div>
+                <div className="font-mono font-black text-white">Neto ${fmtUSD(d.por_moneda.usd.neto)}</div>
+              </div>
+              <div className="rounded-xl bg-[#09090b] border border-[#222227] p-3 space-y-0.5">
+                <div className="font-bold text-zinc-200">🇻🇪 Bolívares</div>
+                <div className="font-mono text-emerald-400">Entró +Bs {fmtUSD(d.por_moneda.bs.entro)}</div>
+                <div className="font-mono text-red-400">Salió −Bs {fmtUSD(d.por_moneda.bs.salio)}</div>
+                <div className="font-mono font-black text-white">Neto Bs {fmtUSD(d.por_moneda.bs.neto)}</div>
+              </div>
+            </div>
+            <div className="text-[10px] text-zinc-500">Lo que de verdad entró y salió en cada moneda. Los cuadros de arriba lo expresan todo en dólares.</div>
           </div>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <Kpi titulo="Vendido (total)" valor={d.ventas_total_usd} nota="Incluye fiados" />
             <Kpi titulo="Costo de insumos" valor={d.costo_insumos_usd} />
-            <Kpi titulo="Nos deben (fiados)" valor={d.por_cobrar_usd} tono="text-amber-400" nota="Pendiente hoy, de todas las fechas" />
-            <Kpi titulo="Debemos (proveedores)" valor={d.por_pagar_usd} tono="text-amber-400" nota="Pendiente hoy, de todas las fechas" />
+            <Kpi titulo="Nos deben (fiados)" valor={d.por_cobrar_usd} tono="text-amber-400" nota="En bolívares, a la tasa de hoy" tasa={d.tasa} />
+            <Kpi titulo="Debemos (proveedores)" valor={d.por_pagar_usd} tono="text-amber-400" nota="En bolívares, a la tasa de hoy" tasa={d.tasa} />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -3405,11 +4396,11 @@ function FinanzasResumen({ sedes }) {
             </div>
             <div className={cardCls}>
               <h3 className="text-xs font-bold text-white uppercase">¿A quién le debemos?</h3>
-              <ListaBarras filas={d.deudas_por_proveedor} color="bg-amber-500" vacio="No hay deudas pendientes con proveedores." />
+              <ListaBarras filas={d.deudas_por_proveedor} color="bg-amber-500" vacio="No hay deudas pendientes con proveedores." tasa={d.tasa} />
             </div>
             <div className={cardCls}>
               <h3 className="text-xs font-bold text-white uppercase">¿Quién nos debe?</h3>
-              <ListaBarras filas={d.fiados_por_cliente} color="bg-amber-500" vacio="No hay fiados pendientes." />
+              <ListaBarras filas={d.fiados_por_cliente} color="bg-amber-500" vacio="No hay fiados pendientes." tasa={d.tasa} />
             </div>
             <div className={cardCls}>
               <h3 className="text-xs font-bold text-white uppercase">Día por día</h3>
@@ -3439,6 +4430,90 @@ function FinanzasResumen({ sedes }) {
 }
 
 // ---------------------------------------------------------- GASTOS
+function NegocioTab({ avisar }) {
+  const [f, setF] = useState(null);
+  const [guardando, setGuardando] = useState(false);
+  const [diag, setDiag] = useState(null);
+  const [revisando, setRevisando] = useState(false);
+  const revisar = async () => {
+    setRevisando(true);
+    const r = await apiAdmin('/api/admin/diagnostico');
+    setRevisando(false);
+    if (r.success) setDiag(r); else avisar(r.error || 'No se pudo revisar.', 'error');
+  };
+  useEffect(() => { revisar(); }, []);
+  useEffect(() => {
+    (async () => {
+      const r = await apiAdmin('/api/admin/negocio');
+      if (r.success) setF(r.datos);
+      else avisar(r.error || 'No se pudieron cargar los datos.', 'error');
+    })();
+  }, []);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const guardar = async () => {
+    setGuardando(true);
+    const r = await apiAdmin('/api/admin/negocio', 'POST', f);
+    setGuardando(false);
+    if (!r.success) return avisar(r.error || 'No se pudo guardar.', 'error');
+    avisar('Datos del negocio guardados ✓');
+  };
+  if (!f) return <div className="text-xs text-zinc-500 py-8 text-center">Cargando…</div>;
+  return (
+    <div className="space-y-4">
+      <div className={cardCls}>
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-xs font-bold text-white uppercase">Revisión del sistema</h3>
+          <button onClick={revisar} disabled={revisando} className={btnSec}>{revisando ? 'Revisando…' : 'Revisar de nuevo'}</button>
+        </div>
+        {!diag && <div className="text-[11px] text-zinc-500">Revisando…</div>}
+        {diag && (
+          <>
+            <div className={`text-xs font-bold ${diag.errores ? 'text-red-400' : diag.avisos ? 'text-amber-400' : 'text-emerald-400'}`}>
+              {diag.errores ? `${diag.errores} cosa(s) por corregir` : diag.avisos ? `Todo funciona; ${diag.avisos} sugerencia(s)` : '✅ Todo en orden'}
+            </div>
+            <div className="space-y-1.5">
+              {diag.checks.map((c, i) => (
+                <div key={i} className="text-[11px]">
+                  <span>{c.nivel === 'ok' ? '✅' : c.nivel === 'aviso' ? '⚠️' : '❌'} </span>
+                  <span className="font-bold text-zinc-200">{c.titulo}</span>
+                  {c.detalle && <div className="text-zinc-500 ml-5">{c.detalle}</div>}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className={cardCls}>
+        <h3 className="text-xs font-bold text-white uppercase">Datos de la empresa (factura)</h3>
+        <div className="text-[11px] text-zinc-400">Salen en la factura digital que le envías al cliente.</div>
+        <Campo label="Nombre comercial *"><input type="text" maxLength={60} value={f.nombre} onChange={set('nombre')} className={inputCls} placeholder="Ej. Family Burger" /></Campo>
+        <Campo label="Razón social"><input type="text" maxLength={100} value={f.razon_social} onChange={set('razon_social')} className={inputCls} placeholder="Ej. Inversiones Family Burger, C.A." /></Campo>
+        <Campo label="RIF"><input type="text" maxLength={20} value={f.rif} onChange={set('rif')} className={inputCls} placeholder="J-12345678-9" /></Campo>
+        <Campo label="Dirección fiscal / del local"><input type="text" maxLength={200} value={f.direccion} onChange={set('direccion')} className={inputCls} placeholder="Calle, sector, ciudad, estado" /></Campo>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Campo label="Teléfono / WhatsApp"><input type="tel" maxLength={30} value={f.telefono} onChange={set('telefono')} className={inputCls} placeholder="0412-1234567" /></Campo>
+          <Campo label="Correo"><input type="email" maxLength={80} value={f.email} onChange={set('email')} className={inputCls} placeholder="ventas@tumarca.com" /></Campo>
+        </div>
+        <Campo label="Prefijo del número de factura"><input type="text" maxLength={6} value={f.prefijo} onChange={set('prefijo')} className={inputCls} placeholder="FB" /></Campo>
+        <Campo label="Texto al pie de la factura (opcional)"><input type="text" maxLength={200} value={f.leyenda} onChange={set('leyenda')} className={inputCls} placeholder="Ej. Documento no fiscal. Síguenos en @tumarca" /></Campo>
+      </div>
+
+      <div className={cardCls}>
+        <h3 className="text-xs font-bold text-white uppercase">Lo que ve el público en el menú</h3>
+        <Campo label="Enlace de Google Maps (botón «Cómo llegar»)"><input type="url" maxLength={300} value={f.maps_url} onChange={set('maps_url')} className={inputCls} placeholder="https://maps.app.goo.gl/..." /></Campo>
+        <Campo label="Horario (opcional)"><input type="text" maxLength={120} value={f.horario} onChange={set('horario')} className={inputCls} placeholder="Lun a Dom 5:00 pm – 11:00 pm" /></Campo>
+        <Campo label="Descripción corta (sale al compartir el link por WhatsApp)"><input type="text" maxLength={140} value={f.descripcion} onChange={set('descripcion')} className={inputCls} /></Campo>
+        <div className="text-[10px] text-zinc-500">WhatsApp guarda las vistas previas por un tiempo: si cambias el nombre o la descripción, puede tardar en verse el cambio.</div>
+      </div>
+
+      <button onClick={guardar} disabled={guardando || f.nombre.trim().length < 2} className={btnPri + ' w-full'}>
+        {guardando ? 'Guardando…' : 'Guardar datos del negocio'}
+      </button>
+    </div>
+  );
+}
+
 function GastosTab({ sedes, avisar }) {
   const [datos, setDatos] = useState({ gastos: [], categorias: [], metodos: [], total_usd: 0 });
   const [desde, setDesde] = useState(hoyCaracas(29));
@@ -3460,7 +4535,8 @@ function GastosTab({ sedes, avisar }) {
   const guardar = async () => {
     setGuardando(true);
     const r = await apiAdmin('/api/admin/gastos', 'POST', {
-      categoria: f.categoria === '__nueva__' ? nuevaCat.trim() : f.categoria, descripcion: f.descripcion, monto_usd: Number(f.monto_usd),
+      categoria: f.categoria === '__nueva__' ? nuevaCat.trim() : f.categoria, descripcion: f.descripcion,
+      ...(metodoEsUSD(f.metodo) ? { monto_usd: Number(f.monto_usd) } : { monto_bs: Number(f.monto_usd) }),
       metodo: f.metodo, sede_id: f.sede_id || null, fecha: f.fecha
     });
     setGuardando(false);
@@ -3512,7 +4588,14 @@ function GastosTab({ sedes, avisar }) {
                 className={inputCls + ' mt-2'} placeholder="Nombre de la categoría nueva" />
             )}
           </Campo>
-          <Campo label="Monto (USD)"><input type="number" inputMode="decimal" min="0" step="0.01" value={f.monto_usd} onChange={e => setF({ ...f, monto_usd: e.target.value })} className={inputCls + ' font-mono'} placeholder="0.00" /></Campo>
+          <Campo label={metodoEsUSD(f.metodo) ? 'Monto (USD)' : 'Monto (Bs)'}>
+            <input type="number" inputMode="decimal" min="0" step="0.01" value={f.monto_usd} onChange={e => setF({ ...f, monto_usd: e.target.value })} className={inputCls + ' font-mono'} placeholder="0.00" />
+            {Number(f.monto_usd) > 0 && datos.tasa > 0 && (
+              <div className="text-[10px] text-zinc-500 mt-1">
+                {metodoEsUSD(f.metodo) ? `≈ Bs ${fmtUSD(Number(f.monto_usd) * datos.tasa)} (tasa de hoy)` : `≈ $${fmtUSD(Number(f.monto_usd) / datos.tasa)} (tasa de hoy)`}
+              </div>
+            )}
+          </Campo>
           <Campo label="Fecha"><input type="date" value={f.fecha} onChange={e => setF({ ...f, fecha: e.target.value })} className={inputCls} /></Campo>
           <Campo label="Pagado con">
             <select value={f.metodo} onChange={e => setF({ ...f, metodo: e.target.value })} className={inputCls}>
@@ -3570,10 +4653,23 @@ function GastosTab({ sedes, avisar }) {
               <div className="flex justify-between items-start gap-2">
                 <div className="min-w-0">
                   <div className="font-bold text-white">{g.categoria}{g.descripcion ? <span className="font-normal text-zinc-400"> · {g.descripcion}</span> : null}</div>
-                  <div className="text-[10px] text-zinc-500">{g.fecha} · {nombreSede(g.sede_id)}{g.metodo ? ' · ' + g.metodo : ''}</div>
+                  <div className="text-[10px] text-zinc-500">{g.fecha} · {nombreSede(g.sede_id)} ·{' '}
+                    <select
+                      value={g.metodo || 'Otro'}
+                      onChange={async (e) => {
+                        const r = await apiAdmin('/api/admin/metodo-pago', 'POST', { tipo: 'gasto', id: g.id, metodo: e.target.value });
+                        if (!r.success) return avisar(r.error, 'error');
+                        avisar('Método corregido ✓');
+                        cargar();
+                      }}
+                      className="bg-[#09090b] border border-[#222227] rounded-lg px-1 py-0.5 text-zinc-300"
+                    >
+                      {datos.metodos.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                  </div>
                 </div>
                 <div className="text-right shrink-0">
-                  <div className="font-mono font-bold text-red-300">${fmtUSD(g.monto_usd)}</div>
+                  <div className="font-mono font-bold text-red-300">${fmtUSD(g.monto_usd)}{g.bs ? <span className="text-[10px] text-zinc-400 font-normal"> · Bs {fmtUSD(g.bs)}</span> : null}</div>
                   <button onClick={() => { setAnulandoId(anulandoId === g.id ? null : g.id); setMotivo(''); }} className="text-[10px] text-zinc-500 hover:text-red-300 underline">anular</button>
                 </div>
               </div>
@@ -3598,7 +4694,8 @@ function DeudasTab({ sedes, avisar }) {
   const [compras, setCompras] = useState([]);
   const [verTodas, setVerTodas] = useState(false);
   const [nuevoProv, setNuevoProv] = useState({ nombre: '', telefono: '' });
-  const [compra, setCompra] = useState({ proveedor_id: '', descripcion: '', total_usd: '', pagado_usd: '', metodo: 'Efectivo USD', fecha: hoyCaracas() });
+  const [compra, setCompra] = useState({ proveedor_id: '', descripcion: '', total_usd: '', pagado_usd: '', metodo: 'Efectivo USD', moneda: 'USD', fecha: hoyCaracas() });
+  const [tasa, setTasa] = useState(0);
   const [abonando, setAbonando] = useState(null);
   const [abono, setAbono] = useState({ monto_usd: '', metodo: 'Efectivo USD' });
   const [ocupado, setOcupado] = useState(false);
@@ -3610,7 +4707,7 @@ function DeudasTab({ sedes, avisar }) {
       apiAdmin('/api/admin/compras?estado=' + (verTodas ? 'todas' : 'pendientes'))
     ]);
     if (p.success) setProveedores(p.proveedores); else avisar(p.error, 'error');
-    if (c.success) setCompras(c.compras); else avisar(c.error, 'error');
+    if (c.success) { setCompras(c.compras); setTasa(c.tasa || 0); } else avisar(c.error, 'error');
   };
   useEffect(() => { cargar(); }, [verTodas]);
 
@@ -3630,7 +4727,7 @@ function DeudasTab({ sedes, avisar }) {
     setOcupado(true);
     const r = await apiAdmin('/api/admin/compras', 'POST', {
       proveedor_id: Number(compra.proveedor_id), descripcion: compra.descripcion,
-      total_usd: Number(compra.total_usd), pagado_usd: Number(compra.pagado_usd) || 0,
+      ...(compra.moneda === 'BS' ? { total_bs: Number(compra.total_usd), pagado_bs: Number(compra.pagado_usd) || 0 } : { total_usd: Number(compra.total_usd), pagado_usd: Number(compra.pagado_usd) || 0 }),
       metodo: compra.metodo, fecha: compra.fecha
     });
     setOcupado(false);
@@ -3642,7 +4739,7 @@ function DeudasTab({ sedes, avisar }) {
 
   const abonar = async (id) => {
     setOcupado(true);
-    const r = await apiAdmin(`/api/admin/compras/${id}/pago`, 'POST', { monto_usd: Number(abono.monto_usd), metodo: abono.metodo });
+    const r = await apiAdmin(`/api/admin/compras/${id}/pago`, 'POST', { ...(metodoEsUSD(abono.metodo) ? { monto_usd: Number(abono.monto_usd) } : { monto_bs: Number(abono.monto_usd) }), metodo: abono.metodo });
     setOcupado(false);
     if (!r.success) return avisar(r.error, 'error');
     avisar('Abono registrado ✓');
@@ -3663,7 +4760,7 @@ function DeudasTab({ sedes, avisar }) {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3">
-        <Kpi titulo="Total que debemos" valor={totalDeuda} tono="text-amber-400" />
+        <Kpi titulo="Total que debemos" valor={totalDeuda} tono="text-amber-400" tasa={tasa} />
         <div className="bg-[#111114] border border-[#222227] rounded-2xl p-3">
           <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-bold">Proveedores con deuda</div>
           <div className="text-lg font-black font-mono mt-1 text-white">{proveedores.filter(p => p.saldo_usd > 0).length}</div>
@@ -3679,8 +4776,16 @@ function DeudasTab({ sedes, avisar }) {
               {proveedores.filter(p => p.vigente).map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
             </select>
           </Campo>
-          <Campo label="Total (USD)"><input type="number" inputMode="decimal" min="0" step="0.01" value={compra.total_usd} onChange={e => setCompra({ ...compra, total_usd: e.target.value })} className={inputCls + ' font-mono'} /></Campo>
-          <Campo label="Pagó ahora (USD)"><input type="number" inputMode="decimal" min="0" step="0.01" value={compra.pagado_usd} onChange={e => setCompra({ ...compra, pagado_usd: e.target.value })} className={inputCls + ' font-mono'} placeholder="0 si es a crédito" /></Campo>
+          <Campo label="Moneda de la compra">
+            <select value={compra.moneda} onChange={e => setCompra({ ...compra, moneda: e.target.value, metodo: e.target.value === 'USD' ? 'Efectivo USD' : 'Pago móvil' })} className={inputCls}>
+              <option value="USD">Dólares ($)</option>
+              <option value="BS">Bolívares (Bs)</option>
+            </select>
+          </Campo>
+          <Campo label={`Total (${compra.moneda === 'BS' ? 'Bs' : 'USD'})`}><input type="number" inputMode="decimal" min="0" step="0.01" value={compra.total_usd} onChange={e => setCompra({ ...compra, total_usd: e.target.value })} className={inputCls + ' font-mono'} />
+            {compra.moneda === 'BS' && Number(compra.total_usd) > 0 && tasa > 0 && <div className="text-[10px] text-zinc-500 mt-1">≈ ${fmtUSD(Number(compra.total_usd) / tasa)} a la tasa de hoy</div>}
+          </Campo>
+          <Campo label={`Pagó ahora (${compra.moneda === 'BS' ? 'Bs' : 'USD'})`}><input type="number" inputMode="decimal" min="0" step="0.01" value={compra.pagado_usd} onChange={e => setCompra({ ...compra, pagado_usd: e.target.value })} className={inputCls + ' font-mono'} placeholder="0 si es a crédito" /></Campo>
           <Campo label="Qué se compró"><input type="text" maxLength={200} value={compra.descripcion} onChange={e => setCompra({ ...compra, descripcion: e.target.value })} className={inputCls} placeholder="Ej: 5 paquetes de salchichas" /></Campo>
           <Campo label="Pagó con">
             <select value={compra.metodo} onChange={e => setCompra({ ...compra, metodo: e.target.value })} className={inputCls}>
@@ -3709,12 +4814,29 @@ function DeudasTab({ sedes, avisar }) {
                 </div>
                 <div className="text-right shrink-0">
                   <div className="font-mono text-zinc-300">Total ${fmtUSD(c.total_usd)}</div>
-                  <div className={`font-mono font-black ${c.saldo_usd > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>{c.saldo_usd > 0 ? 'Debe $' + fmtUSD(c.saldo_usd) : 'Pagada'}</div>
+                  <div className={`font-mono font-black ${c.saldo_usd > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>{c.saldo_usd > 0 ? 'Debe $' + fmtUSD(c.saldo_usd) + (tasa > 0 ? ' · Bs ' + fmtUSD(c.saldo_usd * tasa) : '') : 'Pagada'}</div>
                 </div>
               </div>
               {c.pagos.length > 0 && (
                 <div className="text-[10px] text-zinc-500">
-                  Pagos: {c.pagos.map((p, i) => <span key={i}>{i ? ' · ' : ''}{p.fecha.slice(5)} ${fmtUSD(p.monto_usd)}</span>)}
+                  <div>Pagos (puedes corregir con qué pagaste: decide de qué caja salió el dinero):</div>
+                  {c.pagos.map((p, i) => (
+                    <div key={p.id || i} className="flex items-center gap-2 mt-1">
+                      <span>{p.fecha.slice(5)} ${fmtUSD(p.monto_usd)}{p.bs ? ' · Bs ' + fmtUSD(p.bs) : ''}</span>
+                      <select
+                        value={p.metodo || 'Otro'}
+                        onChange={async (e) => {
+                          const r = await apiAdmin('/api/admin/metodo-pago', 'POST', { tipo: 'pago', id: p.id, metodo: e.target.value });
+                          if (!r.success) return avisar(r.error, 'error');
+                          avisar('Método corregido ✓');
+                          cargar();
+                        }}
+                        className="bg-[#09090b] border border-[#222227] rounded-lg px-1.5 py-0.5 text-zinc-300"
+                      >
+                        {metodos.map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    </div>
+                  ))}
                 </div>
               )}
               <Comprobantes entidad="compra" entidadId={c.id} etiqueta="Facturas y comprobantes de pago" />
@@ -3727,11 +4849,13 @@ function DeudasTab({ sedes, avisar }) {
               {abonando === c.id && (
                 <div className="flex flex-wrap items-center gap-2">
                   <input type="number" inputMode="decimal" min="0" step="0.01" value={abono.monto_usd} onChange={e => setAbono({ ...abono, monto_usd: e.target.value })} className={inputCls + ' w-28 font-mono'} />
-                  <select value={abono.metodo} onChange={e => setAbono({ ...abono, metodo: e.target.value })} className={inputCls + ' w-auto'}>
+                  <select value={abono.metodo} onChange={e => { const nuevo = e.target.value; let m = abono.monto_usd; if (tasa > 0 && Number(m) > 0 && metodoEsUSD(nuevo) !== metodoEsUSD(abono.metodo)) m = metodoEsUSD(nuevo) ? (Number(m) / tasa).toFixed(2) : (Number(m) * tasa).toFixed(2); setAbono({ ...abono, metodo: nuevo, monto_usd: m }); }} className={inputCls + ' w-auto'}>
                     {metodos.map(m => <option key={m} value={m}>{m}</option>)}
                   </select>
+                  <span className="text-[10px] text-zinc-400">{metodoEsUSD(abono.metodo) ? 'monto en $' : 'monto en Bs'}</span>
                   <button onClick={() => abonar(c.id)} disabled={ocupado || !(Number(abono.monto_usd) > 0)} className={btnPri}>Confirmar</button>
                   <button onClick={() => setAbonando(null)} className={btnSec}>Cancelar</button>
+                  <div className="w-full text-[10px] text-zinc-500">El método decide de qué caja sale el dinero: Efectivo USD y Zelle salen de dólares; Efectivo Bs, Pago móvil y Transferencia salen de bolívares (a la tasa del día).</div>
                 </div>
               )}
             </div>
@@ -4108,10 +5232,40 @@ function AppInner({ usuarioInicial, onLogout }) {
   // Pedidos que llegan desde el menú público
   const [pedidosWeb, setPedidosWeb] = useState([]);
   const [avisoWeb] = useState({ activos: 0 });
+  const [tiendaAbierta, setTiendaAbierta] = useState(true);
+  const cambiarTienda = async (abierta) => {
+    const r = await apiAdmin('/api/tienda/estado', 'POST', { abierta });
+    if (r.success) setTiendaAbierta(r.tienda_abierta); else alert(r.error || 'No se pudo cambiar.');
+  };
+  // Caja real: ventas cobradas − gastos − pagos a proveedores ± ajustes (lo calcula el servidor)
+  const [caja, setCaja] = useState(null);
+  const [modalCaja, setModalCaja] = useState(false);
+  const [formCaja, setFormCaja] = useState({ moneda: 'BS', tipo: 'SALIDA', monto: '', motivo: '' });
+  const [guardandoCaja, setGuardandoCaja] = useState(false);
+  const cargarCaja = async () => {
+    const r = await apiAdmin('/api/caja');
+    if (r.success) setCaja(r);
+  };
+  useEffect(() => {
+    cargarCaja();
+    const t = setInterval(cargarCaja, 30000);
+    return () => clearInterval(t);
+  }, []);
+  const guardarAjusteCaja = async () => {
+    if (!(Number(formCaja.monto) > 0)) { alert('Escribe un monto mayor a 0.'); return; }
+    if (formCaja.motivo.trim().length < 3) { alert('Escribe el motivo.'); return; }
+    setGuardandoCaja(true);
+    const r = await apiAdmin('/api/caja/ajuste', 'POST', { ...formCaja, monto: Number(formCaja.monto) });
+    setGuardandoCaja(false);
+    if (!r.success) { alert(r.error || 'No se pudo guardar.'); return; }
+    setFormCaja({ moneda: formCaja.moneda, tipo: formCaja.tipo, monto: '', motivo: '' });
+    cargarCaja();
+  };
   const cargarPedidosWeb = async () => {
     const r = await apiAdmin('/api/pedidos-web');
     if (r.success) {
       setPedidosWeb(r.pedidos);
+      if (typeof r.tienda_abierta === 'boolean') setTiendaAbierta(r.tienda_abierta);
       const activos = r.pedidos.filter(p => p.estado === 'PENDIENTE_PAGO' || p.estado === 'PAGO_REPORTADO').length;
       if (activos > avisoWeb.activos) sonarAviso();
       avisoWeb.activos = activos;
@@ -4164,7 +5318,60 @@ function AppInner({ usuarioInicial, onLogout }) {
   const [insumos, setInsumos] = useState(INSUMOS_SEMILLA);
   const [productos, setProductos] = useState(PRODUCTOS_SEMILLA);
   const [ordenes, setOrdenes] = useState([]);
+  // La caja se recalcula al cambiar de pantalla y cada vez que cambia la cantidad de órdenes
+  useEffect(() => { cargarCaja(); }, [vistaActual, ordenes.length]);
   const [auditoriaLogs, setAuditoriaLogs] = useState([]);
+  const [turnosCerrados, setTurnosCerrados] = useState([]);
+  const [turnoAbierto, setTurnoAbierto] = useState(null);
+  const [turnosRecientes, setTurnosRecientes] = useState([]);
+  const [modalAbrirTurno, setModalAbrirTurno] = useState(false);
+  const [modalCerrarTurno, setModalCerrarTurno] = useState(false);
+  const [formTurnoAbrir, setFormTurnoAbrir] = useState({ fondo_inicial_usd: '', fondo_inicial_bs: '' });
+  const [formTurnoCerrar, setFormTurnoCerrar] = useState({ efectivo_declarado_usd: '', efectivo_declarado_bs: '', notas_cierre: '' });
+  const [resumenCierreTurno, setResumenCierreTurno] = useState(null);
+  const [guardandoTurno, setGuardandoTurno] = useState(false);
+
+  const cargarTurnoActual = async () => {
+    const r = await apiAdmin('/api/turnos/actual');
+    if (r.success) {
+      setTurnoAbierto(r.turno_abierto || null);
+      setTurnosRecientes(r.turnos_recientes || []);
+    }
+  };
+  useEffect(() => { cargarTurnoActual(); }, []);
+
+  const abrirTurnoCaja = async () => {
+    setGuardandoTurno(true);
+    const r = await apiAdmin('/api/turnos/abrir', 'POST', {
+      sede_id: sedeActivaId,
+      fondo_inicial_usd: Number(formTurnoAbrir.fondo_inicial_usd || 0),
+      fondo_inicial_bs: Number(formTurnoAbrir.fondo_inicial_bs || 0)
+    });
+    setGuardandoTurno(false);
+    if (!r.success) { alert(r.error || 'No se pudo abrir el turno.'); return; }
+    setFormTurnoAbrir({ fondo_inicial_usd: '', fondo_inicial_bs: '' });
+    setModalAbrirTurno(false);
+    cargarTurnoActual();
+  };
+
+  const cerrarTurnoCaja = async () => {
+    if (formTurnoCerrar.efectivo_declarado_usd === '' && formTurnoCerrar.efectivo_declarado_bs === '') {
+      alert('Ingresa el efectivo contado en USD y/o Bs para realizar el arqueo ciego.');
+      return;
+    }
+    setGuardandoTurno(true);
+    const r = await apiAdmin('/api/turnos/cerrar', 'POST', {
+      efectivo_declarado_usd: Number(formTurnoCerrar.efectivo_declarado_usd || 0),
+      efectivo_declarado_bs: Number(formTurnoCerrar.efectivo_declarado_bs || 0),
+      notas_cierre: formTurnoCerrar.notas_cierre
+    });
+    setGuardandoTurno(false);
+    if (!r.success) { alert(r.error || 'No se pudo cerrar el turno.'); return; }
+    setResumenCierreTurno(r.resumen);
+    setFormTurnoCerrar({ efectivo_declarado_usd: '', efectivo_declarado_bs: '', notas_cierre: '' });
+    cargarTurnoActual();
+    cargarDesdeBackend();
+  };
 
   const cargarDesdeBackend = async () => {
     try {
@@ -4186,7 +5393,9 @@ function AppInner({ usuarioInicial, onLogout }) {
         if (data.productos && data.productos.length > 0) setProductos(data.productos);
         if (data.inventario_sedes && Object.keys(data.inventario_sedes).length > 0) setInventarioSedes(data.inventario_sedes);
         if (data.metodos_qr && data.metodos_qr.length > 0) setMetodosQR(data.metodos_qr);
-        if (data.ordenes && data.ordenes.length > 0) setOrdenes(data.ordenes);
+        if (data.ordenes) setOrdenes(data.ordenes);
+        if (data.auditoria_logs) setAuditoriaLogs(data.auditoria_logs);
+        if (data.turnos_cerrados) setTurnosCerrados(data.turnos_cerrados);
       }
     } catch (e) {
       console.warn('Operando en caché local:', e);
@@ -4256,10 +5465,101 @@ function AppInner({ usuarioInicial, onLogout }) {
   // Inventario (entradas, ajustes, transferencias, insumos)
   const [sedeStockSel, setSedeStockSel] = useState(null);
   const [modalMovAbierto, setModalMovAbierto] = useState(false);
-  const [movForm, setMovForm] = useState({ tipo: 'COMPRA', insumo_id: '', cantidad: '', unidadEntrada: 'unidad', sede_destino_id: '', motivo: '', costo_paquete_usd: '', nuevo_stock: '' });
+  const [movForm, setMovForm] = useState({ tipo: 'COMPRA', insumo_id: '', cantidad: '', unidadEntrada: 'unidad', sede_destino_id: '', motivo: '', costo_paquete_usd: '', nuevo_stock: '', total_pagado: '', pagado_ahora: '', moneda: 'BS', metodo: 'Pago móvil', proveedor_id: '', proveedor_nuevo: '' });
+  const [provsMov, setProvsMov] = useState([]);
   const [modalInsumoAbierto, setModalInsumoAbierto] = useState(false);
   const [insumoForm, setInsumoForm] = useState(null);
   const [guardando, setGuardando] = useState(false);
+
+  // Cola offline de ventas POS (evita perder ventas si se cae internet)
+  const [colaOffline, setColaOffline] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('doggipos_cola_offline') || '[]'); } catch (e) { return []; }
+  });
+  const [sincronizandoCola, setSincronizandoCola] = useState(false);
+  const guardarColaOffline = (lista) => {
+    setColaOffline(lista);
+    try { localStorage.setItem('doggipos_cola_offline', JSON.stringify(lista)); } catch (e) {}
+  };
+  const sincronizarColaOffline = async () => {
+    if (!colaOffline.length || sincronizandoCola) return;
+    setSincronizandoCola(true);
+    const pendientes = [];
+    let okCount = 0;
+    for (const payload of colaOffline) {
+      try {
+        const r = await fetch('/api/orden/crear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.success) okCount++;
+        else pendientes.push(payload);
+      } catch (e) {
+        pendientes.push(payload);
+      }
+    }
+    guardarColaOffline(pendientes);
+    setSincronizandoCola(false);
+    if (okCount > 0) {
+      await cargarDesdeBackend();
+      cargarCaja();
+    }
+    if (pendientes.length > 0) alert(`Se sincronizaron ${okCount} venta(s), pero quedan ${pendientes.length} pendientes por revisar.`);
+  };
+
+  // Reinicio operativo (Comenzar de Cero)
+  const [resetForm, setResetForm] = useState({
+    confirmacion: '',
+    pin: '',
+    reiniciar_inventario: true,
+    capital_inicial_usd: '',
+    capital_inicial_bs: '',
+    justificacion: ''
+  });
+  const [reiniciandoSistema, setReiniciandoSistema] = useState(false);
+  const ejecutarReinicioOperativo = async () => {
+    if (resetForm.confirmacion.trim().toUpperCase() !== 'REINICIAR') {
+      alert('Escribe exactamente REINICIAR para confirmar.');
+      return;
+    }
+    if (!resetForm.pin.trim()) {
+      alert('Ingresa tu PIN de superusuario.');
+      return;
+    }
+    if (!window.confirm('Esta acción borrará ventas, caja, gastos, compras y kardex anteriores para comenzar de cero. Tus productos, recetas, usuarios y sedes se conservarán. ¿Deseas continuar?')) {
+      return;
+    }
+    setReiniciandoSistema(true);
+    try {
+      const r = await fetch('/api/admin/reiniciar-operacion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          confirmacion: resetForm.confirmacion,
+          pin: resetForm.pin,
+          reiniciar_inventario: resetForm.reiniciar_inventario,
+          capital_inicial_usd: Number(resetForm.capital_inicial_usd || 0),
+          capital_inicial_bs: Number(resetForm.capital_inicial_bs || 0),
+          justificacion: resetForm.justificacion
+        })
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.success) {
+        alert(d.error || 'No se pudo reiniciar la operación.');
+      } else {
+        guardarColaOffline([]);
+        setResetForm({ confirmacion: '', pin: '', reiniciar_inventario: true, capital_inicial_usd: '', capital_inicial_bs: '', justificacion: '' });
+        await cargarDesdeBackend();
+        await cargarCaja();
+        await cargarPedidosWeb();
+        alert('Operación reiniciada correctamente. Ya puedes cargar tu inventario físico real y comenzar de cero.');
+      }
+    } catch (e) {
+      alert('Sin conexión con el servidor.');
+    }
+    setReiniciandoSistema(false);
+  };
 
   // Mi cuenta / PIN
   const [pinActual, setPinActual] = useState('');
@@ -4446,26 +5746,27 @@ function AppInner({ usuarioInicial, onLogout }) {
     };
 
     setOrdenes(prev => [nuevaOrden, ...prev]);
+    const payloadOrden = {
+      sede_id: sedeActivaId,
+      cajero_id: usuarioActual.id,
+      cliente_nombre: nuevaOrden.cliente_nombre,
+      cliente_telefono: nuevaOrden.cliente_telefono,
+      recibido_usd: nuevaOrden.recibido_usd,
+      recibido_bs: nuevaOrden.recibido_bs,
+      vuelto_usd: nuevaOrden.vuelto_usd,
+      vuelto_bs: nuevaOrden.vuelto_bs,
+      estado_pago: nuevaOrden.estado_pago,
+      notas_cocina: notasCocina,
+      referencia_pago: referenciaParaGuardar,
+      items: carrito.map(c => ({ producto_id: c.producto.id, cantidad: c.cantidad, modificadores: c.modificadores }))
+    };
     fetch('/api/orden/crear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sede_id: sedeActivaId,
-        cajero_id: usuarioActual.id,
-        cliente_nombre: nuevaOrden.cliente_nombre,
-        cliente_telefono: nuevaOrden.cliente_telefono,
-        recibido_usd: nuevaOrden.recibido_usd,
-        recibido_bs: nuevaOrden.recibido_bs,
-        vuelto_usd: nuevaOrden.vuelto_usd,
-        vuelto_bs: nuevaOrden.vuelto_bs,
-        estado_pago: nuevaOrden.estado_pago,
-        notas_cocina: notasCocina,
-        referencia_pago: referenciaParaGuardar,
-        items: carrito.map(c => ({ producto_id: c.producto.id, cantidad: c.cantidad, modificadores: c.modificadores }))
-      })
+      body: JSON.stringify(payloadOrden)
     }).then(r => r.json()).then(d => {
       if (d && d.success === false) {
-        alert('No se pudo guardar la orden: ' + (d.error || 'error desconocido'));
+        alert('No se pudo guardar la orden en el servidor: ' + (d.error || 'error desconocido'));
       } else if (d && d.orden_id) {
         setVentaReciente({
           id: d.orden_id,
@@ -4483,7 +5784,10 @@ function AppInner({ usuarioInicial, onLogout }) {
         }
       }
       cargarDesdeBackend();
-    }).catch(err => console.warn('Guardado en cola local:', err));
+    }).catch(() => {
+      guardarColaOffline([...colaOffline, payloadOrden]);
+      alert('Sin conexión: la venta se guardó en tu dispositivo. Pulsa "Sincronizar ventas pendientes" apenas vuelva el internet para descontar el inventario.');
+    });
     setCarrito([]);
     setModalCobroAbierto(false);
     setCobroRecibidoUSD(0);
@@ -4532,8 +5836,10 @@ function AppInner({ usuarioInicial, onLogout }) {
     setMovForm({
       tipo,
       insumo_id: insumoId || (insumos[0] ? insumos[0].id : ''),
-      cantidad: '', unidadEntrada: 'unidad', sede_destino_id: '', motivo: '', costo_paquete_usd: '', nuevo_stock: ''
+      cantidad: '', unidadEntrada: 'unidad', sede_destino_id: '', motivo: '', costo_paquete_usd: '', nuevo_stock: '',
+      total_pagado: '', pagado_ahora: '', moneda: 'BS', metodo: 'Pago móvil', proveedor_id: '', proveedor_nuevo: ''
     });
+    apiAdmin('/api/admin/proveedores').then(r => { if (r && r.success) setProvsMov(r.proveedores.filter(p => p.vigente)); });
     setModalMovAbierto(true);
   };
 
@@ -4556,6 +5862,25 @@ function AppInner({ usuarioInicial, onLogout }) {
       if (movForm.tipo === 'COMPRA' && movForm.costo_paquete_usd !== '') {
         body.costo_paquete_usd = Number(movForm.costo_paquete_usd);
       }
+      if (movForm.tipo === 'COMPRA') {
+        if (movForm.total_pagado === '' || Number(movForm.total_pagado) < 0) { alert('Escribe cuánto pagaste por esta compra (pon 0 si no costó nada).'); return; }
+        if (Number(movForm.total_pagado) > 0) {
+          let provId = movForm.proveedor_id;
+          if (provId === 'nuevo') {
+            if (!movForm.proveedor_nuevo.trim()) { alert('Escribe el nombre del proveedor.'); return; }
+            const rp = await apiAdmin('/api/admin/proveedores', 'POST', { nombre: movForm.proveedor_nuevo });
+            if (!rp.success) { alert(rp.error || 'No se pudo crear el proveedor.'); return; }
+            provId = rp.id;
+          }
+          body.total_pagado = Number(movForm.total_pagado);
+          body.moneda = movForm.moneda;
+          body.metodo = movForm.metodo;
+          if (provId) {
+            body.proveedor_id = Number(provId);
+            if (movForm.pagado_ahora !== '') body.pagado_ahora = Number(movForm.pagado_ahora);
+          }
+        }
+      }
     }
     setGuardando(true);
     try {
@@ -4570,6 +5895,7 @@ function AppInner({ usuarioInicial, onLogout }) {
       } else {
         setModalMovAbierto(false);
         await cargarDesdeBackend();
+        cargarCaja();
       }
     } catch (e) { alert('Sin conexión con el servidor.'); }
     setGuardando(false);
@@ -4691,6 +6017,15 @@ function AppInner({ usuarioInicial, onLogout }) {
     const totalRecibidoBS = validas.reduce((acc, o) => acc + o.recibido_bs, 0);
     const totalVueltoUSD = validas.reduce((acc, o) => acc + o.vuelto_usd, 0);
     const totalVueltoBS = validas.reduce((acc, o) => acc + o.vuelto_bs, 0);
+    const brechaCambiariaUSD = validas.reduce((acc, o) => {
+      const bsNeto = Math.max(0, (o.recibido_bs || 0) - (o.vuelto_bs || 0));
+      const ta = Number(o.tasa_aplicada || 0);
+      const tr = Number(o.tasa_reposicion_momento || 0);
+      if (bsNeto > 0 && ta > 0 && tr > ta) {
+        return acc + ((bsNeto / ta) - (bsNeto / tr));
+      }
+      return acc;
+    }, 0);
 
     // Agrupación por día para gráfica
     const porDia = {};
@@ -4712,6 +6047,7 @@ function AppInner({ usuarioInicial, onLogout }) {
       totalRecibidoBS,
       totalVueltoUSD,
       totalVueltoBS,
+      brechaCambiariaUSD,
       listaDias,
       ordenes: validas
     };
@@ -4735,10 +6071,11 @@ function AppInner({ usuarioInicial, onLogout }) {
 
     const tablaInsumos = insumos.map(ins => {
       const consumo = consumosPorInsumo[ins.id] || 0;
-      // Stock total según sedes filtradas
+      // Stock total dinámico según sedes operativas activas
       let stockActual = 0;
+      const sedesOperativas = sedes.filter(s => !s.es_almacen && s.activa !== false);
       if (filtroSedeReporte === 'todas') {
-        stockActual = (inventarioSedes[`2_${ins.id}`] || 0) + (inventarioSedes[`3_${ins.id}`] || 0);
+        stockActual = sedesOperativas.reduce((acc, s) => acc + (inventarioSedes[`${s.id}_${ins.id}`] || 0), 0);
       } else {
         stockActual = inventarioSedes[`${filtroSedeReporte}_${ins.id}`] || 0;
       }
@@ -4768,7 +6105,7 @@ function AppInner({ usuarioInicial, onLogout }) {
       tablaInsumos,
       totalValorConsumido
     };
-  }, [ordenesFiltradasReporte, insumos, productos, inventarioSedes, filtroSedeReporte, reporte1_Ventas.listaDias.length]);
+  }, [ordenesFiltradasReporte, insumos, productos, inventarioSedes, sedes, filtroSedeReporte, reporte1_Ventas.listaDias.length]);
 
   // Reporte 3: Rentabilidad por Producto y Sede
   const reporte3_Rentabilidad = useMemo(() => {
@@ -4799,17 +6136,17 @@ function AppInner({ usuarioInicial, onLogout }) {
       };
     }).sort((a, b) => b.ingresosUSD - a.ingresosUSD);
 
-    // Comparativa por Sede
-    const sedesAnalizadas = [2, 3].map(sId => {
+    // Comparativa dinámica por todas las Sedes operativas
+    const sedesAnalizadas = sedes.filter(s => !s.es_almacen && s.activa !== false).map(sedeObj => {
+      const sId = sedeObj.id;
       const ordsSede = validas.filter(o => o.sede_id === sId);
       const sTotalUSD = ordsSede.reduce((acc, o) => acc + o.total_venta_usd, 0);
       const sCostoBOM = ordsSede.reduce((acc, o) => acc + o.costo_insumos_usd, 0);
       const sGanancia = sTotalUSD - sCostoBOM;
       const sMargen = sTotalUSD > 0 ? (sGanancia / sTotalUSD) * 100 : 0;
-      const sedeObj = sedes.find(s => s.id === sId);
       return {
         sede_id: sId,
-        nombre: sedeObj ? sedeObj.nombre : `Sede ${sId}`,
+        nombre: sedeObj.nombre || `Sede ${sId}`,
         totalUSD: sTotalUSD,
         costoBOM: sCostoBOM,
         gananciaBruta: sGanancia,
@@ -4834,7 +6171,7 @@ function AppInner({ usuarioInicial, onLogout }) {
   // Reporte 4: Desempeño de Cajeros
   const reporte4_Cajeros = useMemo(() => {
     const validas = ordenesFiltradasReporte.filter(o => o.estado_pago === 'PAGADA');
-    const cajerosList = usuariosSistema.filter(u => u.rol === 'cajero' || u.id === 1);
+    const cajerosList = usuariosSistema.filter(u => (u.rol === 'cajero' || u.rol === 'superusuario') && u.username !== 'pedido_web');
 
     const stats = cajerosList.map(caj => {
       const ords = validas.filter(o => o.cajero_id === caj.id);
@@ -4851,12 +6188,14 @@ function AppInner({ usuarioInicial, onLogout }) {
         totalUSD,
         totalBS,
         ticketPromedio,
-        diferenciaArqueoUSD: 0 // Arqueo cuadrado
+        diferenciaArqueoUSD: turnosCerrados
+          .filter(t => t.cajero_id === caj.id && (filtroSedeReporte === 'todas' || t.sede_id === filtroSedeReporte) && t.fecha_corta >= fechaInicioReporte && t.fecha_corta <= fechaFinReporte)
+          .reduce((acc, t) => acc + (t.diferencia_arqueo_usd || 0), 0)
       };
     });
 
     return stats;
-  }, [ordenesFiltradasReporte, sedes]);
+  }, [ordenesFiltradasReporte, sedes, usuariosSistema, turnosCerrados, filtroSedeReporte, fechaInicioReporte, fechaFinReporte]);
 
   // ==============================================================
   // GENERADORES DE EXPORTACIÓN (CSV Y PDF/PRINT)
@@ -5003,6 +6342,52 @@ function AppInner({ usuarioInicial, onLogout }) {
         {/* VISTA 1: POS / CAJA */}
         {vistaActual === 'pos' && (
           <div className="space-y-4">
+            {/* Barra de Turno de Caja (Arqueo Ciego) */}
+            <div className="bg-[#111114] border border-[#222227] rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div className="flex items-center space-x-2">
+                <span className={`w-2.5 h-2.5 rounded-full ${turnoAbierto ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-600'}`}></span>
+                {turnoAbierto ? (
+                  <div>
+                    <span className="font-bold text-white">Turno #{turnoAbierto.id} abierto</span>
+                    <span className="text-zinc-400 ml-2">Desde {turnoAbierto.apertura_at} • Fondo: ${turnoAbierto.fondo_inicial_usd.toFixed(2)} / Bs {turnoAbierto.fondo_inicial_bs.toFixed(2)}</span>
+                  </div>
+                ) : (
+                  <span className="text-zinc-400">Sin turno abierto. Abre tu turno antes de iniciar ventas para auditar el arqueo de caja.</span>
+                )}
+              </div>
+              <div className="flex items-center space-x-2">
+                {!turnoAbierto ? (
+                  <button
+                    onClick={() => { setResumenCierreTurno(null); setModalAbrirTurno(true); }}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3.5 py-2 rounded-xl whitespace-nowrap"
+                  >
+                    Abrir Turno
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => { setResumenCierreTurno(null); setModalCerrarTurno(true); }}
+                    className="bg-amber-600 hover:bg-amber-500 text-white font-bold px-3.5 py-2 rounded-xl whitespace-nowrap"
+                  >
+                    Cerrar Turno (Arqueo Ciego)
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {colaOffline.length > 0 && (
+              <div className="bg-amber-950/50 border border-amber-700 rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                <div className="text-amber-200">
+                  <b>{colaOffline.length} venta(s) guardada(s) sin conexión.</b> Sincronízalas para registrar el dinero y descontar el inventario.
+                </div>
+                <button
+                  onClick={sincronizarColaOffline}
+                  disabled={sincronizandoCola}
+                  className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-black px-3.5 py-2 rounded-xl whitespace-nowrap"
+                >
+                  {sincronizandoCola ? 'Sincronizando…' : `Sincronizar ahora (${colaOffline.length})`}
+                </button>
+              </div>
+            )}
             {/* Barra superior del POS */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               {usuarioActual.rol === 'superusuario' ? (
@@ -5037,21 +6422,39 @@ function AppInner({ usuarioInicial, onLogout }) {
                 <div className="text-xs">
                   <span className="text-zinc-400 text-[10px] uppercase font-bold block">Gaveta Física USD</span>
                   <span className="text-base font-black text-emerald-400 font-mono">
-                    ${ordenes.filter(o => o.sede_id === sedeActivaId && o.estado_pago === 'PAGADA').reduce((acc, o) => acc + o.recibido_usd - o.vuelto_usd, 0).toFixed(2)}
+                    ${caja ? caja.usd.saldo.toFixed(2) : '…'}
                   </span>
                 </div>
-                <div className="text-[10px] text-zinc-500 text-right">Efectivo en billetes</div>
+                <div className="text-[10px] text-zinc-500 text-right leading-tight">
+                  {caja ? (<>
+                    <div>Ventas +{caja.usd.ingresos.toFixed(2)}</div>
+                    <div>Salidas −{caja.usd.egresos.toFixed(2)}</div>
+                    {caja.usd.ajustes !== 0 && <div>Ajustes {caja.usd.ajustes > 0 ? '+' : ''}{caja.usd.ajustes.toFixed(2)}</div>}
+                  </>) : 'Efectivo en billetes'}
+                </div>
               </div>
 
               <div className="bg-[#111114] border border-[#222227] p-3 rounded-2xl flex items-center justify-between">
                 <div className="text-xs">
                   <span className="text-zinc-400 text-[10px] uppercase font-bold block">Banco Bs (Pago Móvil)</span>
                   <span className="text-base font-black text-[#60a5fa] font-mono">
-                    Bs {ordenes.filter(o => o.sede_id === sedeActivaId && o.estado_pago === 'PAGADA').reduce((acc, o) => acc + o.recibido_bs - o.vuelto_bs, 0).toFixed(2)}
+                    Bs {caja ? caja.bs.saldo.toFixed(2) : '…'}
                   </span>
                 </div>
-                <div className="text-[10px] text-zinc-500 text-right">Saldo acumulado</div>
+                <div className="text-[10px] text-zinc-500 text-right leading-tight">
+                  {caja ? (<>
+                    <div>Ventas +{caja.bs.ingresos.toFixed(2)}</div>
+                    <div>Salidas −{caja.bs.egresos.toFixed(2)}</div>
+                    {caja.bs.ajustes !== 0 && <div>Ajustes {caja.bs.ajustes > 0 ? '+' : ''}{caja.bs.ajustes.toFixed(2)}</div>}
+                  </>) : 'Saldo acumulado'}
+                </div>
               </div>
+            </div>
+            <div className="flex items-center justify-between text-[10px] text-zinc-500 -mt-2">
+              <span>{caja && caja.alcance === 'todas' ? 'Caja de todas las sedes · lo que debe haber: ventas − gastos − pagos a proveedores' : 'Caja de esta sede'}</span>
+              {usuarioActual.rol === 'superusuario' && (
+                <button onClick={() => setModalCaja(true)} className="underline underline-offset-2 hover:text-zinc-300">✎ Ajustar caja / retiros</button>
+              )}
             </div>
 
             {/* Categorías */}
@@ -5213,7 +6616,7 @@ function AppInner({ usuarioInicial, onLogout }) {
                 }`}
               >
                 <ChefHat className="w-4 h-4" />
-                <span>En Preparación ({ordenes.filter(o => o.estado_cocina === 'PREPARANDO' && o.sede_id === sedeActivaId).length})</span>
+                <span>En Preparación / Listos ({ordenes.filter(o => (o.estado_cocina === 'PREPARANDO' || o.estado_cocina === 'LISTO') && o.estado_pago !== 'ANULADA' && o.sede_id === sedeActivaId).length})</span>
               </button>
               <button
                 onClick={() => setTabCocina('fiados')}
@@ -5241,7 +6644,7 @@ function AppInner({ usuarioInicial, onLogout }) {
             {tabCocina === 'preparando' && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {ordenes
-                  .filter(o => o.estado_cocina === 'PREPARANDO' && o.estado_pago !== 'ANULADA' && o.sede_id === sedeActivaId)
+                  .filter(o => (o.estado_cocina === 'PREPARANDO' || o.estado_cocina === 'LISTO') && o.estado_pago !== 'ANULADA' && o.sede_id === sedeActivaId)
                   .map(ord => (
                     <div
                       key={ord.id}
@@ -5257,8 +6660,12 @@ function AppInner({ usuarioInicial, onLogout }) {
                           </div>
                           <div className="text-[10px] text-zinc-400 mt-0.5">Hora: {ord.created_at}</div>
                         </div>
-                        <span className="bg-amber-950/60 border border-amber-800 text-amber-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                          En Cocina
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                          ord.estado_cocina === 'LISTO'
+                            ? 'bg-emerald-950/70 border-emerald-700 text-emerald-300'
+                            : 'bg-amber-950/60 border-amber-800 text-amber-400'
+                        }`}>
+                          {ord.estado_cocina === 'LISTO' ? '🔔 Listo para retirar' : 'En Cocina'}
                         </span>
                       </div>
 
@@ -5274,26 +6681,41 @@ function AppInner({ usuarioInicial, onLogout }) {
 
                       <AccionesOrden ord={ord} />
 
-                      <button
-                        onClick={() => {
-                          setOrdenes(prev =>
-                            prev.map(o => (o.id === ord.id ? { ...o, estado_cocina: 'ENTREGADO' } : o))
-                          );
-                          fetch('/api/orden/estado', {
-                            method: 'PATCH',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ orden_id: ord.id, estado_cocina: 'ENTREGADO' })
-                          }).catch(err => console.warn(err));
-                        }}
-                        className="w-full py-2.5 bg-[#2563eb] hover:bg-[#1d4ed8] text-white text-xs font-bold rounded-xl flex items-center justify-center space-x-2 transition"
-                      >
-                        <CheckCircle2 className="w-4 h-4" />
-                        <span>Marcar Entregado</span>
-                      </button>
+                      <div className="grid grid-cols-2 gap-2">
+                        {ord.estado_cocina !== 'LISTO' && (
+                          <button
+                            onClick={() => {
+                              setOrdenes(prev => prev.map(o => (o.id === ord.id ? { ...o, estado_cocina: 'LISTO' } : o)));
+                              fetch('/api/orden/estado', {
+                                method: 'PATCH',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ orden_id: ord.id, estado_cocina: 'LISTO' })
+                              }).catch(err => console.warn(err));
+                            }}
+                            className="py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl transition"
+                          >
+                            🔔 Listo para retirar
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            setOrdenes(prev => prev.map(o => (o.id === ord.id ? { ...o, estado_cocina: 'ENTREGADO' } : o)));
+                            fetch('/api/orden/estado', {
+                              method: 'PATCH',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ orden_id: ord.id, estado_cocina: 'ENTREGADO' })
+                            }).catch(err => console.warn(err));
+                          }}
+                          className={`${ord.estado_cocina === 'LISTO' ? 'col-span-2' : ''} py-2.5 bg-[#2563eb] hover:bg-[#1d4ed8] text-white text-xs font-bold rounded-xl flex items-center justify-center space-x-2 transition`}
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>Marcar Entregado</span>
+                        </button>
+                      </div>
                     </div>
                   ))}
 
-                {ordenes.filter(o => o.estado_cocina === 'PREPARANDO' && o.sede_id === sedeActivaId).length === 0 && (
+                {ordenes.filter(o => (o.estado_cocina === 'PREPARANDO' || o.estado_cocina === 'LISTO') && o.estado_pago !== 'ANULADA' && o.sede_id === sedeActivaId).length === 0 && (
                   <div className="col-span-full py-12 text-center text-zinc-500 text-xs font-medium">
                     No hay pedidos pendientes en la cola de cocina para {sedeActual.nombre}.
                   </div>
@@ -5303,6 +6725,15 @@ function AppInner({ usuarioInicial, onLogout }) {
 
             {tabCocina === 'webs' && (
               <div className="space-y-3">
+                <div className={`flex items-center justify-between gap-3 rounded-2xl border p-3 ${tiendaAbierta ? 'bg-emerald-950/30 border-emerald-800' : 'bg-red-950/30 border-red-900'}`}>
+                  <div className="text-xs">
+                    <div className="font-bold text-white">{tiendaAbierta ? '🟢 Tienda en línea ABIERTA' : '🔴 Tienda en línea CERRADA'}</div>
+                    <div className="text-[10px] text-zinc-400">{tiendaAbierta ? 'Los clientes pueden hacer pedidos desde el menú.' : 'Los clientes ven el menú pero no pueden pedir.'}</div>
+                  </div>
+                  <button onClick={() => cambiarTienda(!tiendaAbierta)} className={`shrink-0 px-3.5 py-2 rounded-xl text-xs font-bold text-white ${tiendaAbierta ? 'bg-red-700 hover:bg-red-600' : 'bg-emerald-700 hover:bg-emerald-600'}`}>
+                    {tiendaAbierta ? 'Cerrar' : 'Abrir'}
+                  </button>
+                </div>
                 {pedidosWebActivos.length === 0 && (
                   <div className="py-12 text-center text-zinc-500 text-xs font-medium">No hay pedidos web esperando pago ni verificación.</div>
                 )}
@@ -5396,7 +6827,7 @@ function AppInner({ usuarioInicial, onLogout }) {
                     const k = String(o.cliente_nombre || 'Sin nombre').trim().toLowerCase();
                     if (!grupos[k]) grupos[k] = { nombre: o.cliente_nombre || 'Sin nombre', telefono: '', total: 0, bs: 0, n: 0 };
                     grupos[k].total += o.total_venta_usd;
-                    grupos[k].bs += o.total_venta_usd * o.tasa_aplicada;
+                    grupos[k].bs += o.total_venta_usd * tasaActiva;
                     grupos[k].n += 1;
                     if (o.cliente_telefono) grupos[k].telefono = o.cliente_telefono;
                   });
@@ -5446,7 +6877,7 @@ function AppInner({ usuarioInicial, onLogout }) {
                           </div>
                           <div className="text-right shrink-0">
                             <div className="font-mono font-black text-amber-400 text-lg">${ord.total_venta_usd.toFixed(2)}</div>
-                            <div className="text-[10px] text-zinc-500 font-mono">Bs {(ord.total_venta_usd * ord.tasa_aplicada).toFixed(2)}</div>
+                            <div className="text-[10px] text-zinc-500 font-mono">Bs {(ord.total_venta_usd * tasaActiva).toFixed(2)} <span className="text-zinc-600">(tasa de hoy)</span></div>
                           </div>
                         </div>
                         <div className="text-[11px] text-zinc-400">
@@ -5638,10 +7069,10 @@ function AppInner({ usuarioInicial, onLogout }) {
                       <span>Bolsillo 1 (Intocable)</span>
                     </div>
                     <div className="text-2xl font-black font-mono text-blue-400 mt-2">
-                      ${reporte1_Ventas.totalCostosBOM.toFixed(2)}
+                      ${(reporte1_Ventas.totalCostosBOM + (reporte1_Ventas.brechaCambiariaUSD || 0)).toFixed(2)}
                     </div>
                     <div className="text-[11px] text-zinc-400 mt-1 leading-snug">
-                      Costo exacto congelado de materias primas para reponer mercancía vendida.
+                      Costo BOM (${reporte1_Ventas.totalCostosBOM.toFixed(2)}) + Brecha cambiaria Bs (${(reporte1_Ventas.brechaCambiariaUSD || 0).toFixed(2)}).
                     </div>
                   </div>
 
@@ -5651,7 +7082,7 @@ function AppInner({ usuarioInicial, onLogout }) {
                       <span>Bolsillo 2 (Reserva Operativa)</span>
                     </div>
                     <div className="text-2xl font-black font-mono text-amber-400 mt-2">
-                      ${((reporte1_Ventas.totalUSD - reporte1_Ventas.totalCostosBOM) * (pctReservaOperativa / 100) + gastosOperativosUSD).toFixed(2)}
+                      ${(Math.max(0, reporte1_Ventas.totalUSD - reporte1_Ventas.totalCostosBOM - (reporte1_Ventas.brechaCambiariaUSD || 0)) * (pctReservaOperativa / 100) + gastosOperativosUSD).toFixed(2)}
                     </div>
                     <div className="text-[11px] text-zinc-400 mt-1 leading-snug">
                       {pctReservaOperativa}% Reserva Operativa + Gastos de jornada declarados.
@@ -5664,7 +7095,7 @@ function AppInner({ usuarioInicial, onLogout }) {
                       <span>Bolsillo 3 (Utilidad Neta Real)</span>
                     </div>
                     <div className="text-2xl font-black font-mono text-emerald-400 mt-2">
-                      ${Math.max(0, (reporte1_Ventas.totalUSD - reporte1_Ventas.totalCostosBOM) * (1 - pctReservaOperativa / 100) - gastosOperativosUSD).toFixed(2)}
+                      ${Math.max(0, (reporte1_Ventas.totalUSD - reporte1_Ventas.totalCostosBOM - (reporte1_Ventas.brechaCambiariaUSD || 0)) * (1 - pctReservaOperativa / 100) - gastosOperativosUSD).toFixed(2)}
                     </div>
                     <div className="text-[11px] text-zinc-400 mt-1 leading-snug">
                       Ganancia libre del dueño tras cubrir insumos, reposición y reservas.
@@ -5733,6 +7164,43 @@ function AppInner({ usuarioInicial, onLogout }) {
                       </div>
                     ))}
                   </div>
+                </div>
+
+                {/* Bitácora Persistente de Auditoría (Base de Datos) */}
+                <div className="bg-[#111114] border border-[#222227] rounded-2xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-bold text-white uppercase tracking-wider">
+                      Bitácora de Eventos de Auditoría ({auditoriaLogs.length})
+                    </h3>
+                    <span className="text-[10px] text-zinc-500">Últimos 50 eventos registrados</span>
+                  </div>
+                  {auditoriaLogs.length === 0 ? (
+                    <div className="text-xs text-zinc-500 py-4 text-center">No hay eventos de auditoría registrados todavía.</div>
+                  ) : (
+                    <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                      {auditoriaLogs.map(log => (
+                        <div key={log.id} className="bg-[#09090b] border border-[#222227] p-3 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                          <div>
+                            <div className="flex items-center space-x-2">
+                              <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-blue-950/70 text-blue-300 border border-blue-800">
+                                {log.accion}
+                              </span>
+                              <span className="text-zinc-300 font-semibold">
+                                {log.entidad_afectada} {log.registro_id ? `#${log.registro_id}` : ''}
+                              </span>
+                              {log.sede_id && (
+                                <span className="text-[10px] text-zinc-500">• Sede {log.sede_id}</span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-zinc-400 mt-1">{log.justificacion}</div>
+                          </div>
+                          <div className="text-[10px] font-mono text-zinc-500 whitespace-nowrap">
+                            {log.created_at}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -6528,6 +7996,101 @@ function AppInner({ usuarioInicial, onLogout }) {
                 </button>
               </div>
             </div>
+
+            {usuarioActual.rol === 'superusuario' && (
+              <div className="bg-red-950/20 border border-red-900/70 p-4 rounded-2xl space-y-3 text-xs">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-black text-red-300 uppercase tracking-wider flex items-center space-x-2">
+                      <RotateCcw className="w-4 h-4 text-red-400" />
+                      <span>Reiniciar Operación (Comenzar de Cero)</span>
+                    </h3>
+                    <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">
+                      Borra ventas, fiados, pedidos web, kardex, gastos, compras y movimientos de caja anteriores para sincerar tu capital y tu mercancía.
+                      <b className="text-zinc-200"> Conserva intactos</b> tus productos, recetas, insumos, sedes, usuarios, Pago Móvil y datos del negocio.
+                    </p>
+                  </div>
+                </div>
+
+                <label className="flex items-center space-x-2 text-xs text-zinc-200 cursor-pointer pt-1">
+                  <input
+                    type="checkbox"
+                    checked={resetForm.reiniciar_inventario}
+                    onChange={e => setResetForm(f => ({ ...f, reiniciar_inventario: e.target.checked }))}
+                    className="rounded border-red-800"
+                  />
+                  <span>Poner todo el inventario de las sedes en 0 (recomendado para hacer conteo físico real)</span>
+                </label>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Capital inicial en caja (USD) — opcional</label>
+                    <input
+                      type="number"
+                      placeholder="0.00"
+                      value={resetForm.capital_inicial_usd}
+                      onChange={e => setResetForm(f => ({ ...f, capital_inicial_usd: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Capital inicial en caja (Bs.) — opcional</label>
+                    <input
+                      type="number"
+                      placeholder="0.00"
+                      value={resetForm.capital_inicial_bs}
+                      onChange={e => setResetForm(f => ({ ...f, capital_inicial_bs: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Escribe REINICIAR para confirmar</label>
+                    <input
+                      type="text"
+                      placeholder="REINICIAR"
+                      value={resetForm.confirmacion}
+                      onChange={e => setResetForm(f => ({ ...f, confirmacion: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-red-900/60 rounded-xl p-2.5 text-white font-mono uppercase"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Tu PIN de Superusuario</label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      placeholder="••••••"
+                      value={resetForm.pin}
+                      onChange={e => setResetForm(f => ({ ...f, pin: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-red-900/60 rounded-xl p-2.5 text-white font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Motivo (opcional)</label>
+                    <input
+                      type="text"
+                      placeholder="Sinceración de capital y stock"
+                      value={resetForm.justificacion}
+                      onChange={e => setResetForm(f => ({ ...f, justificacion: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end pt-1">
+                  <button
+                    onClick={ejecutarReinicioOperativo}
+                    disabled={reiniciandoSistema}
+                    className="bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white font-black px-4 py-2.5 rounded-xl flex items-center space-x-2 transition"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    <span>{reiniciandoSistema ? 'Reiniciando…' : 'Reiniciar Operación y Comenzar de Cero'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -6739,15 +8302,6 @@ function AppInner({ usuarioInicial, onLogout }) {
           </button>
         )}
 
-        <button
-          onClick={() => setVistaActual('deploy')}
-          className={`flex flex-col items-center transition ${
-            vistaActual === 'deploy' ? 'text-[#2563eb]' : 'text-zinc-500 hover:text-zinc-300'
-          }`}
-        >
-          <FileCode className="w-5 h-5" />
-          <span className="text-[10px] font-medium mt-0.5">Render</span>
-        </button>
       </nav>
 
       {/* ============================================================== */}
@@ -6941,6 +8495,50 @@ function AppInner({ usuarioInicial, onLogout }) {
       {/* ============================================================== */}
       {/* MODAL DE COBRO INTELIGENTE & VUELTOS CRUZADOS                   */}
       {/* ============================================================== */}
+      {modalCaja && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 print:hidden">
+          <div className="bg-[#111114] border border-[#222227] w-full max-w-sm rounded-2xl p-5 space-y-3 max-h-[90vh] overflow-y-auto text-xs">
+            <div className="flex justify-between items-center pb-2 border-b border-[#222227]">
+              <h3 className="font-bold text-sm text-white">Ajustar caja</h3>
+              <button onClick={() => setModalCaja(false)} className="text-zinc-400 hover:text-white">✕</button>
+            </div>
+            <div className="text-[11px] text-zinc-400">
+              Usa esto para retiros del dueño, depósitos, el saldo con que empezaste o para corregir una diferencia. Los gastos y los pagos a proveedores ya restan solos según el método que elijas al registrarlos.
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <select value={formCaja.moneda} onChange={e => setFormCaja({ ...formCaja, moneda: e.target.value })} className="bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white">
+                <option value="BS">Bolívares (Bs)</option>
+                <option value="USD">Dólares ($)</option>
+              </select>
+              <select value={formCaja.tipo} onChange={e => setFormCaja({ ...formCaja, tipo: e.target.value })} className="bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white">
+                <option value="SALIDA">Salida (resta)</option>
+                <option value="ENTRADA">Entrada (suma)</option>
+              </select>
+            </div>
+            <input type="number" inputMode="decimal" min="0" step="0.01" value={formCaja.monto} onChange={e => setFormCaja({ ...formCaja, monto: e.target.value })}
+              placeholder="Monto" className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono" />
+            <input type="text" maxLength={150} value={formCaja.motivo} onChange={e => setFormCaja({ ...formCaja, motivo: e.target.value })}
+              placeholder="Motivo (ej. retiro del dueño, saldo inicial, corrección)" className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white" />
+            <button onClick={guardarAjusteCaja} disabled={guardandoCaja} className="w-full py-2.5 bg-[#2563eb] hover:bg-[#1d4ed8] disabled:opacity-50 font-bold text-white rounded-xl">
+              {guardandoCaja ? 'Guardando…' : 'Guardar movimiento'}
+            </button>
+            {caja && caja.movimientos && caja.movimientos.length > 0 && (
+              <div className="pt-2 border-t border-[#222227] space-y-1">
+                <div className="text-[10px] uppercase font-bold text-zinc-500">Últimos ajustes</div>
+                {caja.movimientos.map(m => (
+                  <div key={m.id} className="flex justify-between text-[11px]">
+                    <span className="text-zinc-300 truncate pr-2">{m.fecha} · {m.motivo}</span>
+                    <span className={`font-mono font-bold ${m.monto >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {m.monto >= 0 ? '+' : '−'}{m.moneda === 'USD' ? '$' : 'Bs '}{Math.abs(m.monto).toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {modalCobroAbierto && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 print:hidden">
           <div className="bg-[#111114] border border-[#222227] w-full max-w-lg rounded-t-3xl sm:rounded-2xl p-5 space-y-4 max-h-[90vh] overflow-y-auto">
@@ -7261,6 +8859,109 @@ function AppInner({ usuarioInicial, onLogout }) {
       {/* ============================================================== */}
       {/* MODAL DE AUDITORÍA: ANULAR ORDEN                               */}
       {/* ============================================================== */}
+      {/* MODAL ABRIR TURNO DE CAJA */}
+      {modalAbrirTurno && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-[#111114] border border-[#222227] rounded-2xl w-full max-w-md p-5 space-y-4 text-xs">
+            <div className="flex justify-between items-center">
+              <h3 className="text-sm font-black text-white uppercase">Abrir Turno de Caja</h3>
+              <button onClick={() => setModalAbrirTurno(false)} className="text-zinc-400 hover:text-white text-base">✕</button>
+            </div>
+            <p className="text-zinc-400">Registra el fondo inicial (sencillo) con el que recibes la caja en <b>{sedeActual?.nombre}</b>.</p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-zinc-400 block mb-1">Fondo inicial USD ($)</label>
+                <input type="number" placeholder="0.00" value={formTurnoAbrir.fondo_inicial_usd}
+                  onChange={e => setFormTurnoAbrir(f => ({ ...f, fondo_inicial_usd: e.target.value }))}
+                  className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono" />
+              </div>
+              <div>
+                <label className="text-zinc-400 block mb-1">Fondo inicial Bs.</label>
+                <input type="number" placeholder="0.00" value={formTurnoAbrir.fondo_inicial_bs}
+                  onChange={e => setFormTurnoAbrir(f => ({ ...f, fondo_inicial_bs: e.target.value }))}
+                  className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono" />
+              </div>
+            </div>
+            <div className="flex justify-end space-x-2 pt-2">
+              <button onClick={() => setModalAbrirTurno(false)} className="px-4 py-2 rounded-xl bg-zinc-800 text-zinc-300 font-bold">Cancelar</button>
+              <button onClick={abrirTurnoCaja} disabled={guardandoTurno} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black">
+                {guardandoTurno ? 'Abriendo…' : 'Confirmar Apertura'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL CERRAR TURNO (ARQUEO CIEGO) */}
+      {modalCerrarTurno && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-[#111114] border border-[#222227] rounded-2xl w-full max-w-md p-5 space-y-4 text-xs">
+            <div className="flex justify-between items-center">
+              <h3 className="text-sm font-black text-white uppercase">Cierre de Turno — Arqueo Ciego</h3>
+              <button onClick={() => setModalCerrarTurno(false)} className="text-zinc-400 hover:text-white text-base">✕</button>
+            </div>
+            {!resumenCierreTurno ? (
+              <>
+                <p className="text-zinc-400">Cuenta el dinero físico en caja e ingrésalo abajo sin ver el esperado. Al confirmar, el sistema calculará el cuadre exacto.</p>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Efectivo contado USD ($)</label>
+                    <input type="number" placeholder="0.00" value={formTurnoCerrar.efectivo_declarado_usd}
+                      onChange={e => setFormTurnoCerrar(f => ({ ...f, efectivo_declarado_usd: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono" />
+                  </div>
+                  <div>
+                    <label className="text-zinc-400 block mb-1">Efectivo / pagos Bs.</label>
+                    <input type="number" placeholder="0.00" value={formTurnoCerrar.efectivo_declarado_bs}
+                      onChange={e => setFormTurnoCerrar(f => ({ ...f, efectivo_declarado_bs: e.target.value }))}
+                      className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono" />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Observaciones del cierre (opcional)</label>
+                  <input type="text" placeholder="Ej: Todo cuadrado, billetes pequeños entregados" value={formTurnoCerrar.notas_cierre}
+                    onChange={e => setFormTurnoCerrar(f => ({ ...f, notas_cierre: e.target.value }))}
+                    className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white" />
+                </div>
+                <div className="flex justify-end space-x-2 pt-2">
+                  <button onClick={() => setModalCerrarTurno(false)} className="px-4 py-2 rounded-xl bg-zinc-800 text-zinc-300 font-bold">Cancelar</button>
+                  <button onClick={cerrarTurnoCaja} disabled={guardandoTurno} className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-black">
+                    {guardandoTurno ? 'Cerrando…' : 'Cerrar y Calcular Arqueo'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="space-y-3">
+                <div className="bg-[#09090b] border border-[#222227] rounded-xl p-3 space-y-2">
+                  <div className="font-bold text-white">Turno #{resumenCierreTurno.turno_id} cerrado ({resumenCierreTurno.ordenes_pagadas} órdenes pagadas)</div>
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <div className="p-2 rounded-lg bg-[#111114] space-y-0.5">
+                      <div className="text-[10px] text-zinc-400 uppercase font-bold">Caja USD</div>
+                      <div className="font-mono text-zinc-300">Esperado: ${resumenCierreTurno.esperado_usd.toFixed(2)}</div>
+                      <div className="font-mono text-white">Contado: ${resumenCierreTurno.declarado_usd.toFixed(2)}</div>
+                      <div className={`font-mono font-black ${Math.abs(resumenCierreTurno.diferencia_usd) <= 0.05 ? 'text-emerald-400' : (resumenCierreTurno.diferencia_usd < 0 ? 'text-red-400' : 'text-amber-400')}`}>
+                        Dif: {resumenCierreTurno.diferencia_usd >= 0 ? '+' : ''}${resumenCierreTurno.diferencia_usd.toFixed(2)}
+                      </div>
+                    </div>
+                    <div className="p-2 rounded-lg bg-[#111114] space-y-0.5">
+                      <div className="text-[10px] text-zinc-400 uppercase font-bold">Caja Bs.</div>
+                      <div className="font-mono text-zinc-300">Esperado: Bs {resumenCierreTurno.esperado_bs.toFixed(2)}</div>
+                      <div className="font-mono text-white">Contado: Bs {resumenCierreTurno.declarado_bs.toFixed(2)}</div>
+                      <div className={`font-mono font-black ${Math.abs(resumenCierreTurno.diferencia_bs) <= 1 ? 'text-emerald-400' : (resumenCierreTurno.diferencia_bs < 0 ? 'text-red-400' : 'text-amber-400')}`}>
+                        Dif: {resumenCierreTurno.diferencia_bs >= 0 ? '+' : ''}Bs {resumenCierreTurno.diferencia_bs.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <button onClick={() => setModalCerrarTurno(false)} className="px-4 py-2 rounded-xl bg-[#2563eb] text-white font-bold">Entendido</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {modalAuditoriaAbierto && ordenParaAuditar && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 print:hidden">
           <div className="bg-[#111114] border border-red-900/60 w-full max-w-md rounded-2xl p-5 space-y-4">
@@ -7399,7 +9100,7 @@ function AppInner({ usuarioInicial, onLogout }) {
 
               {movForm.tipo === 'COMPRA' && (
                 <div>
-                  <label className="text-zinc-400 block mb-1">Nuevo costo del paquete en USD (opcional)</label>
+                  <label className="text-zinc-400 block mb-1">Nuevo costo por paquete en USD (opcional: actualiza el costo de tus recetas, no mueve dinero)</label>
                   <input
                     type="number" min="0" step="any"
                     value={movForm.costo_paquete_usd}
@@ -7407,6 +9108,61 @@ function AppInner({ usuarioInicial, onLogout }) {
                     placeholder={insumoMov ? `Actual: ${insumoMov.costo_paquete_usd}` : ''}
                     className="w-full bg-[#09090b] border border-[#222227] rounded-xl p-2.5 text-white font-mono"
                   />
+                </div>
+              )}
+
+              {movForm.tipo === 'COMPRA' && (
+                <div className="space-y-2 bg-[#09090b] border border-amber-900/60 rounded-xl p-3">
+                  <div className="text-[11px] font-bold text-amber-300">💸 ¿Cuánto pagaste por esta compra? (sale de la caja)</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <select
+                      value={movForm.moneda}
+                      onChange={e => setMovForm(f => ({ ...f, moneda: e.target.value, metodo: e.target.value === 'USD' ? 'Efectivo USD' : 'Pago móvil' }))}
+                      className="bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white"
+                    >
+                      <option value="BS">Bolívares (Bs)</option>
+                      <option value="USD">Dólares ($)</option>
+                    </select>
+                    <input
+                      type="number" min="0" step="any" placeholder="Total pagado"
+                      value={movForm.total_pagado}
+                      onChange={e => setMovForm(f => ({ ...f, total_pagado: e.target.value }))}
+                      className="bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white font-mono"
+                    />
+                  </div>
+                  <select
+                    value={movForm.metodo}
+                    onChange={e => setMovForm(f => ({ ...f, metodo: e.target.value }))}
+                    className="w-full bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white"
+                  >
+                    {['Efectivo USD', 'Zelle', 'Efectivo Bs', 'Pago móvil', 'Transferencia', 'Otro'].map(m => <option key={m} value={m}>Pagué con: {m}</option>)}
+                  </select>
+                  <select
+                    value={movForm.proveedor_id}
+                    onChange={e => setMovForm(f => ({ ...f, proveedor_id: e.target.value }))}
+                    className="w-full bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white"
+                  >
+                    <option value="">Proveedor: ninguno (pagué todo)</option>
+                    {provsMov.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                    <option value="nuevo">+ Proveedor nuevo…</option>
+                  </select>
+                  {movForm.proveedor_id === 'nuevo' && (
+                    <input type="text" placeholder="Nombre del proveedor" value={movForm.proveedor_nuevo}
+                      onChange={e => setMovForm(f => ({ ...f, proveedor_nuevo: e.target.value }))}
+                      className="w-full bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white" />
+                  )}
+                  {movForm.proveedor_id && (
+                    <input
+                      type="number" min="0" step="any"
+                      placeholder="Pagado ahora (si pagaste menos, el resto queda como deuda)"
+                      value={movForm.pagado_ahora}
+                      onChange={e => setMovForm(f => ({ ...f, pagado_ahora: e.target.value }))}
+                      className="w-full bg-[#111114] border border-[#222227] rounded-xl p-2.5 text-white font-mono"
+                    />
+                  )}
+                  <div className="text-[10px] text-zinc-500">
+                    Si lo pagaste completo, se descuenta de la caja ya. Si pagaste solo una parte, elige el proveedor: el resto queda en «Proveedores y deudas». Pon 0 si no costó nada.
+                  </div>
                 </div>
               )}
 
@@ -7671,7 +9427,8 @@ function TiendaPublica({ onIrLogin }) {
   useEffect(() => {
     if (!token) return;
     cargarPedido();
-    if (['EXPIRADA', 'RECHAZADA', 'CONFIRMADA'].includes(estadoActual)) return;
+    const cocinaActual = pedido ? pedido.estado_cocina : null;
+    if (['EXPIRADA', 'RECHAZADA'].includes(estadoActual) || (estadoActual === 'CONFIRMADA' && cocinaActual === 'ENTREGADO')) return;
     const t = setInterval(cargarPedido, 5000);
     return () => clearInterval(t);
   }, [token, estadoActual]);
@@ -7777,6 +9534,9 @@ function TiendaPublica({ onIrLogin }) {
                   <span className="text-2xl font-black text-amber-400 font-mono">{fmtBsP(pedido.total_bs)}</span>
                 </div>
                 {pedido.sede && <div className="text-[11px] text-zinc-500">Retiro en: {pedido.sede}</div>}
+                {menu && menu.maps_url && (
+                  <a href={menu.maps_url} target="_blank" rel="noreferrer" className="inline-block text-[11px] font-bold text-amber-400 underline underline-offset-4">🗺️ Cómo llegar</a>
+                )}
               </div>
 
               {pedido.estado === 'PENDIENTE_PAGO' && (
@@ -7836,8 +9596,14 @@ function TiendaPublica({ onIrLogin }) {
 
               {pedido.estado === 'CONFIRMADA' && (
                 <div className="bg-emerald-950/40 border border-emerald-800 rounded-2xl p-4 text-center space-y-2">
-                  <div className="text-2xl">🍔</div>
-                  <div className="font-bold text-emerald-300">¡Pago confirmado! Tu pedido está en preparación.</div>
+                  <div className="text-2xl">{pedido.estado_cocina === 'LISTO' ? '🔔' : (pedido.estado_cocina === 'ENTREGADO' ? '✅' : '🍔')}</div>
+                  <div className="font-bold text-emerald-300">
+                    {pedido.estado_cocina === 'LISTO'
+                      ? '¡Tu pedido está LISTO para retirar!'
+                      : (pedido.estado_cocina === 'ENTREGADO'
+                          ? 'Pedido entregado. ¡Buen provecho!'
+                          : '¡Pago confirmado! Tu pedido está en preparación.')}
+                  </div>
                   {pedido.factura_url && (
                     <a href={pedido.factura_url} target="_blank" rel="noreferrer" className="inline-block px-4 py-2 rounded-xl bg-[#18181b] border border-[#2a2a31] text-xs font-bold">
                       🧾 Ver mi factura
@@ -7897,7 +9663,7 @@ function TiendaPublica({ onIrLogin }) {
           <div className="space-y-3">
             <input type="text" placeholder="Tu nombre" value={datos.nombre} onChange={e => setDatos(d => ({ ...d, nombre: e.target.value }))} className={inputP} />
             <input type="tel" inputMode="tel" placeholder="Tu teléfono (WhatsApp)" value={datos.telefono} onChange={e => setDatos(d => ({ ...d, telefono: e.target.value }))} className={inputP} />
-            <input type="text" placeholder="Notas (opcional): sin cebolla, etc." value={datos.notas} onChange={e => setDatos(d => ({ ...d, notas: e.target.value }))} className={inputP} />
+            <input type="text" placeholder="Notas (opcional): sin cebolla, dirección si pides delivery…" value={datos.notas} onChange={e => setDatos(d => ({ ...d, notas: e.target.value }))} className={inputP} />
           </div>
           <div className="text-[11px] text-zinc-400 text-center">
             Apartamos tu pedido por {menu ? menu.vence_min : 15} minutos para que completes el pago. Si no lo registras a tiempo, se cancela.
@@ -7919,6 +9685,17 @@ function TiendaPublica({ onIrLogin }) {
         <div className="pt-3 text-center">
           <h1 className="text-2xl font-black tracking-tight">{menu ? menu.negocio : 'Menú'}</h1>
           <div className="text-[11px] text-zinc-500 mt-1">Elige lo que quieres y paga desde tu teléfono</div>
+          {menu && (menu.direccion || menu.maps_url || menu.horario) && (
+            <div className="mt-3 space-y-1.5 text-[11px] text-zinc-400">
+              {menu.direccion && <div>📍 {menu.direccion}</div>}
+              {menu.horario && <div>🕒 {menu.horario}</div>}
+              {menu.maps_url && (
+                <a href={menu.maps_url} target="_blank" rel="noreferrer" className="inline-block px-3.5 py-1.5 rounded-full bg-[#18181b] border border-[#2a2a31] text-amber-400 font-bold">
+                  🗺️ Cómo llegar
+                </a>
+              )}
+            </div>
+          )}
         </div>
 
         {menu && menu.sedes.length > 1 && (
@@ -7932,6 +9709,12 @@ function TiendaPublica({ onIrLogin }) {
           </div>
         )}
 
+        {menu && menu.abierta === false && (
+          <div className="bg-red-950/40 border border-red-900 rounded-2xl p-3.5 text-center text-xs text-red-200">
+            <div className="font-bold text-sm">Estamos cerrados por ahora</div>
+            <div className="mt-0.5">Puedes ver el menú, pero todavía no recibimos pedidos. ¡Vuelve pronto!</div>
+          </div>
+        )}
         {cargandoMenu && <div className="py-16 text-center text-zinc-500 text-sm">Cargando el menú…</div>}
         {!cargandoMenu && menu && menu.productos.length === 0 && <div className="py-16 text-center text-zinc-500 text-sm">El menú no está disponible por ahora.</div>}
 
@@ -7956,7 +9739,7 @@ function TiendaPublica({ onIrLogin }) {
                         {agotado ? 'Agotado' : p.disponible === null ? 'Disponible' : p.disponible >= 99 ? 'Disponibles: 99+' : `Disponibles: ${p.disponible}`}
                       </div>
                     </div>
-                    {!agotado && (
+                    {!agotado && !(menu && menu.abierta === false) && (
                       <div className="flex items-center gap-2 shrink-0">
                         {cant > 0 && (
                           <>
@@ -8086,8 +9869,7 @@ function App() {
 
   const cerrarSesion = async () => {
     try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) {}
-    setMostrarLogin(false);
-    setUsuario(null);
+    window.location.href = '/';
   };
 
   if (verificando) {
@@ -8122,32 +9904,62 @@ def _cabecera_meta(titulo, privado=False):
     """Título, descripción y vista previa (WhatsApp, Facebook...) con el nombre real del negocio."""
     base = request.url_root.rstrip("/")
     e = lambda t: html_escape(str(t), quote=True)
-    desc = NEGOCIO_DESCRIPCION[:140]
+    desc = _ndesc()[:140]
     tags = [
         f"<title>{e(titulo)}</title>",
         f'<meta name="description" content="{e(desc)}" />',
         '<meta property="og:type" content="website" />',
-        f'<meta property="og:site_name" content="{e(NEGOCIO_NOMBRE)}" />',
+        f'<meta property="og:site_name" content="{e(_nn())}" />',
         f'<meta property="og:title" content="{e(titulo)}" />',
         f'<meta property="og:description" content="{e(desc)}" />',
         f'<meta property="og:url" content="{e(base + request.path)}" />',
         f'<meta property="og:image" content="{e(base)}/og.png" />',
         '<meta property="og:image:width" content="1200" />',
         '<meta property="og:image:height" content="630" />',
-        f'<meta property="og:image:alt" content="{e(NEGOCIO_NOMBRE)}" />',
+        f'<meta property="og:image:alt" content="{e(_nn())}" />',
         '<meta name="twitter:card" content="summary_large_image" />',
         '<meta name="theme-color" content="#09090b" />',
         '<link rel="icon" href="/favicon.svg" type="image/svg+xml" />',
     ]
     if privado:
         tags.append('<meta name="robots" content="noindex" />')
-    nombre_js = json.dumps(NEGOCIO_NOMBRE).replace("<", "\\u003c")
+    nombre_js = json.dumps(_nn()).replace("<", "\\u003c")
     tags.append(f"<script>window.NEGOCIO_NOMBRE = {nombre_js};</script>")
     return "\n  ".join(tags)
 
 
-def _pagina(titulo, privado=False):
-    resp = app.response_class(response=HTML_TEMPLATE.replace("<!--META-->", _cabecera_meta(titulo, privado), 1), status=200, mimetype="text/html")
+def _construir_html_tienda():
+    """Construye una versión ultraligera (~10x menor) solo con TiendaPublica y PantallaLogin para clientes móviles."""
+    inicio_head = HTML_TEMPLATE.index("<script type=\"text/babel\">")
+    header = HTML_TEMPLATE[:inicio_head + len("<script type=\"text/babel\">")]
+    m_dec_ini = HTML_TEMPLATE.index("    const { useState, useEffect, useMemo, useRef } = React;")
+    m_dec_fin = HTML_TEMPLATE.index("    // Generador ligero de iconos SVG")
+    bloque_base = HTML_TEMPLATE[m_dec_ini:m_dec_fin]
+    m_tienda_ini = HTML_TEMPLATE.index("const fmtBsP =")
+    m_tienda_fin = HTML_TEMPLATE.index("function App() {")
+    bloque_tienda = HTML_TEMPLATE[m_tienda_ini:m_tienda_fin]
+    app_publica = """
+function AppPublica() {
+  const [mostrarLogin, setMostrarLogin] = useState(false);
+  return mostrarLogin
+    ? <PantallaLogin onOk={() => window.location.reload()} onVolver={() => setMostrarLogin(false)} />
+    : <TiendaPublica onIrLogin={() => setMostrarLogin(true)} />;
+}
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<AppPublica />);
+  </script>
+</body>
+</html>
+"""
+    return header + "\n" + bloque_base + "\n" + bloque_tienda + app_publica
+
+
+HTML_TIENDA_TEMPLATE = _construir_html_tienda()
+
+
+def _pagina(titulo, privado=False, forzar_publica=False):
+    plantilla = HTML_TIENDA_TEMPLATE if (forzar_publica or not session.get("user_id")) else HTML_TEMPLATE
+    resp = app.response_class(response=plantilla.replace("<!--META-->", _cabecera_meta(titulo, privado), 1), status=200, mimetype="text/html")
     if privado:
         resp.headers["X-Robots-Tag"] = "noindex"
     return resp
@@ -8155,7 +9967,7 @@ def _pagina(titulo, privado=False):
 
 @app.route("/", methods=["GET"])
 def index():
-    return _pagina(f"{NEGOCIO_NOMBRE} | Pedidos en línea")
+    return _pagina(f"{_nn()} | Pedidos en línea")
 
 
 _OG_CACHE = {}
@@ -8164,7 +9976,7 @@ _OG_CACHE = {}
 @app.route("/og.png", methods=["GET"])
 def imagen_vista_previa():
     """Imagen 1200x630 (liviana, menos de 300 KB) que sale al compartir el link por WhatsApp."""
-    clave = NEGOCIO_NOMBRE
+    clave = _nn()
     if clave not in _OG_CACHE:
         from PIL import Image, ImageDraw, ImageFont
         W, H = 1200, 630
@@ -8191,7 +10003,7 @@ def imagen_vista_previa():
         d.rounded_rectangle([cx - 120, cy + 30, cx + 120, cy + 62], radius=14, fill=(120, 53, 15))
         d.pieslice([cx - 118, cy + 40, cx + 118, cy + 112], 0, 180, fill=(217, 119, 6))
 
-        nombre = NEGOCIO_NOMBRE.strip() or "Pedidos en línea"
+        nombre = _nn().strip() or "Pedidos en línea"
         tam = 112
         f = fuente(tam)
         while d.textlength(nombre, font=f) > W - 120 and tam > 40:
@@ -8224,9 +10036,10 @@ def favicon_ico():
 @app.route("/pedido/<token>", methods=["GET"])
 def pagina_pedido(token):
     """El cliente vuelve a su pedido desde este enlace (la página lee el token de la dirección)."""
-    return _pagina(f"Tu pedido | {NEGOCIO_NOMBRE}", privado=True)
+    return _pagina(f"Tu pedido | {_nn()}", privado=True, forzar_publica=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     print(f">> Iniciando Burger Admin Unificado en http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+```
